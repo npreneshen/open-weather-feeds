@@ -1,0 +1,13 @@
+[
+  { "id": "earthquakes", "label": "Earthquakes", "provider": "USGS", "cors": true, "default": true, "group": "hazards", "history": "regional FDSN" },
+  { "id": "volcanoes", "label": "Volcanoes", "provider": "USGS / Smithsonian", "cors": true, "default": true, "group": "hazards" },
+  { "id": "tsunami", "label": "Tsunami events", "provider": "NOAA NCEI / NWS", "cors": true, "default": false, "group": "hazards" },
+  { "id": "nwsalerts", "label": "US weather alerts", "provider": "NWS", "cors": true, "default": false, "group": "hazards" },
+  { "id": "weather", "label": "Weather (50 cities)", "provider": "Open-Meteo", "cors": true, "default": false, "group": "atmosphere", "history": "16d · 15-min · pressure levels" },
+  { "id": "weathergrid", "label": "Weather grid (bbox)", "provider": "Open-Meteo", "cors": true, "default": false, "group": "atmosphere", "history": "bbox fetch · click for full charts" },
+  { "id": "airquality", "label": "Air quality (50 cities)", "provider": "Open-Meteo", "cors": true, "default": false, "group": "atmosphere", "history": "AQI · PM · O₃ · NO₂ · UV" },
+  { "id": "marine", "label": "Marine / coastal (27 ports)", "provider": "Open-Meteo Marine", "cors": true, "default": false, "group": "ocean", "history": "waves · swell · SST · current" },
+  { "id": "spaceweather", "label": "Space weather", "provider": "NOAA SWPC", "cors": true, "default": false, "group": "space", "statusOnly": true, "history": "Kp, solar wind, X-ray" },
+  { "id": "aurora", "label": "Aurora forecast", "provider": "NOAA SWPC", "cors": true, "default": false, "group": "space" },
+  { "id": "earthimagery", "label": "Earth observation (STAC)", "provider": "Earth Search", "cors": true, "default": false, "group": "imagery" }
+]

@@ -1,0 +1,45 @@
+USGS Tracker — quick start
+==========================
+
+Requirements
+  • Windows PC
+  • Python 3 from https://python.org (tick "Add Python to PATH" during install)
+  • No API keys — USGS feeds are free and public
+
+How to run
+  1. Copy the whole usgs-tracker folder
+  2. Double-click "Start USGS Tracker.bat"
+  3. Wait for the browser to open (http://127.0.0.1:19090)
+  4. Opens on the Global tab by default — switch to Water (IV) for US streamgages
+
+Modes
+  • Water — US & territories streamgages only (NWIS IV)
+  • Global — worldwide USGS hazard JSON feeds:
+      - Earthquakes (global seismic events, pre-built feeds + FDSN query)
+      - Volcanoes (Smithsonian GVP worldwide catalog + USGS alert status)
+      - "All global layers" loads both on the same map
+
+Globe integration
+  • Export GeoJSON includes layer tags: usgs-water, usgs-earthquake, usgs-volcano
+  • Global Feeds — CORS-only build (no proxy): http://127.0.0.1:19090/global-cors/
+    Double-click "Start Global Feeds.bat" to open this directly.
+    Layers: earthquakes, volcanoes, tsunami, US weather alerts (NWS),
+    Open-Meteo weather (50 cities), air quality, marine/coastal, space weather,
+    aurora, earth imagery (STAC).
+    Open-Meteo: 15-min data, pressure levels (1000–200 hPa), weather model picker,
+    bounding-box grid fetch (draw rectangle, max 1000 cells). Bbox models: ECMWF, ICON Global, GEM, UKMO, BOM, CMA.
+    Excluded (no Access-Control-Allow-Origin): cyclones, buoys, METAR, aircraft, JPL CNEOS
+  • Scout NEO layer: map shows zenith subpoint at ephemeris time; detail panel has RA/Dec sky chart
+  • GeoJSON export: ground points (WGS84), Scout celestial (ICRS ra/dec), CAD/Sentry orbital (no geometry)
+
+Troubleshooting
+  • "Server not ready" → close other copies, run the .bat again
+  • Fetch seems stuck → nationwide poll takes several minutes; watch the site count
+    climb in the header and right-hand list as each state completes
+  • HTTP 400 on water fetch → only happens in subregion bbox mode if the box is
+    too large; use "US nationwide" or a single state instead
+  • Python not found → reinstall Python with "Add to PATH" checked
+
+Data sources
+  • Water: https://waterservices.usgs.gov/nwis/iv/
+  • Earthquakes: https://earthquake.usgs.gov/earthquakes/feed/v1.0/

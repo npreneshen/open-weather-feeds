@@ -1,0 +1,8 @@
+[
+  { "code": "00060", "name": "Discharge", "unit": "ft³/s", "short": "Flow" },
+  { "code": "00065", "name": "Gage height", "unit": "ft", "short": "Stage" },
+  { "code": "00010", "name": "Water temperature", "unit": "°C", "short": "Temp" },
+  { "code": "00054", "name": "Reservoir storage", "unit": "acre-ft", "short": "Storage" },
+  { "code": "62614", "name": "Lake elevation", "unit": "ft", "short": "Elevation" },
+  { "code": "72019", "name": "Depth to water", "unit": "ft", "short": "Depth" }
+]

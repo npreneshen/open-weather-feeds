@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "functions": {
+    "api/data/proxy.js": { "maxDuration": 60 },
+    "api/usgs/proxy.js": { "maxDuration": 60 }
+  }
+}

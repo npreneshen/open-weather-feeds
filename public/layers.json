@@ -1,0 +1,18 @@
+[
+  { "id": "earthquakes", "label": "Earthquakes", "provider": "USGS", "global": true, "realtime": true, "default": true, "group": "hazards" },
+  { "id": "volcanoes", "label": "Volcanoes", "provider": "USGS / Smithsonian", "global": true, "realtime": false, "default": true, "group": "hazards" },
+  { "id": "cyclones", "label": "Tropical cyclones", "provider": "NOAA NHC", "global": true, "realtime": true, "default": true, "group": "hazards" },
+  { "id": "tsunami", "label": "Tsunami events", "provider": "NOAA NCEI / NWS", "global": true, "realtime": true, "default": false, "group": "hazards" },
+  { "id": "volcanicash", "label": "Volcanic ash advisories", "provider": "AviationWeather", "global": true, "realtime": true, "default": false, "group": "hazards" },
+  { "id": "fireballs", "label": "Meteors / fireballs", "provider": "NASA CNEOS", "global": true, "realtime": true, "default": false, "group": "hazards" },
+  { "id": "neoapproach", "label": "NEO close approaches", "provider": "NASA JPL CAD", "global": true, "realtime": false, "default": false, "group": "space", "listOnly": true },
+  { "id": "sentry", "label": "NEO impact risk (Sentry)", "provider": "NASA JPL", "global": true, "realtime": true, "default": false, "group": "space", "listOnly": true },
+  { "id": "scout", "label": "NEO candidates (Scout)", "provider": "NASA JPL", "global": true, "realtime": true, "default": false, "group": "space", "note": "Map: zenith subpoint at ephemeris time; detail: sky chart (RA/Dec)" },
+  { "id": "buoys", "label": "Ocean buoys", "provider": "NOAA NDBC", "global": true, "realtime": true, "default": false, "group": "ocean", "history": "station timeseries" },
+  { "id": "metar", "label": "Weather stations", "provider": "AviationWeather", "global": true, "realtime": true, "default": false, "group": "atmosphere", "history": "24h obs" },
+  { "id": "airquality", "label": "Air quality", "provider": "Open-Meteo", "global": true, "realtime": true, "default": false, "group": "atmosphere", "history": "7d hourly" },
+  { "id": "aircraft", "label": "Aircraft", "provider": "OpenSky", "global": true, "realtime": true, "default": false, "group": "transport" },
+  { "id": "spaceweather", "label": "Space weather (K-index)", "provider": "NOAA SWPC", "global": true, "realtime": true, "default": false, "group": "space", "statusOnly": true, "history": "3-day Kp" },
+  { "id": "aurora", "label": "Aurora forecast", "provider": "NOAA SWPC", "global": true, "realtime": true, "default": false, "group": "space" },
+  { "id": "earthimagery", "label": "Earth observation (STAC)", "provider": "Earth Search", "global": true, "realtime": false, "default": false, "group": "imagery" }
+]
