@@ -1,0 +1,42 @@
+# Node dependencies
+node_modules/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Cloudflare Wrangler local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+.wrangler-state/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+coverage/
+.nyc_output/
+
+# Editors
+.vscode/
+.idea/
+*.code-workspace
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archives and local build output
+*.zip
+dist/
+build/

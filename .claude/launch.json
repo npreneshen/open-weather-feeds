@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "open-weather",
+      "port": 19090,
+      "url": "http://localhost:19090"
+    }
+  ]
+}

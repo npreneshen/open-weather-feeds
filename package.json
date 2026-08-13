@@ -1,0 +1,20 @@
+{
+  "name": "metis-weather-feeds",
+  "version": "3.6.0",
+  "description": "Unified weather, water and hazards dashboard with a Cloudflare Worker gateway",
+  "author": "Preneshen",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "wrangler": "^4.115.0"
+  }
+}
