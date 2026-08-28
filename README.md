@@ -2,7 +2,7 @@
 
 **Live dashboard:** [Try Metis Weather](https://weather.metiscore.space)
 
-> **⚠️ The hosted versions (sacpi.metiscore.space) is not tied to this repo.** It's deployed straight
+> **⚠️ The hosted versions (weather.metiscore.space) is not tied to this repo.** It's deployed straight
 > from a working folder via `wrangler pages deploy`, independently of `git`/GitHub — deploying
 > does not commit anything, and committing/pushing does not redeploy the site. The two can and
 > do drift out of sync.
