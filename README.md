@@ -212,6 +212,8 @@ key-handling, news-query handling, chart axes and the compatibility redirect.
 ## Licence
 
 Project code is released under the [Apache License, Version 2.0](LICENSE.txt).
-Each upstream dataset retains its own terms and attribution requirements;
-review [SOURCES.md](SOURCES.md) before redistributing data or using the
+Forks and redistributions must carry forward the attribution in
+[NOTICE.txt](NOTICE.txt), per Section 4 of the license. Each upstream dataset
+retains its own terms and attribution requirements; review
+[SOURCES.md](SOURCES.md) before redistributing data or using the
 dashboard commercially.

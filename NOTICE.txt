@@ -1,0 +1,18 @@
+Metis Weather Feeds
+Copyright 2026 Preneshen Naicker
+
+This product includes software developed by Preneshen Naicker
+(https://weather.metiscore.space).
+
+If you use, fork, or redistribute this project or a substantial part
+of it, please keep this notice and credit "Metis Weather Feeds by
+Preneshen Naicker" (https://github.com/npreneshen/open-weather-feeds)
+as the original source, per Section 4 of the accompanying Apache
+License, Version 2.0 (see LICENSE.txt).
+
+This product displays live data and imagery from third-party public
+providers, each of which retains its own rights, attribution
+requirements and terms of use. See SOURCES.md for the complete list
+and provider-specific attribution notes, including NOAA/NWS/NESDIS,
+USGS, NASA, EUMETSAT, CIRA/RAMMB (Colorado State University),
+Copernicus/Sentinel Hub, EOX, and Open-Meteo.
