@@ -9,17 +9,30 @@ window.PointChartsModal = (() => {
     style.textContent = `
       .point-charts-modal{position:absolute;z-index:8000;display:none;min-width:360px;min-height:300px;
         width:620px;max-width:calc(100% - 24px);height:440px;max-height:calc(100% - 24px);overflow:hidden;
-        background:rgba(6,23,30,.985);border:1px solid #587078;box-shadow:7px 7px 0 rgba(0,0,0,.42);
+        background:linear-gradient(135deg,var(--glass-panel-a,rgba(16,39,45,.9)),var(--glass-panel-b,rgba(7,25,31,.85)));
+        backdrop-filter:var(--glass-blur,blur(18px));-webkit-backdrop-filter:var(--glass-blur,blur(18px));
+        border:1px solid var(--glass-line,#587078);border-radius:8px;background-clip:padding-box;
+        box-shadow:var(--glass-inner,inset 0 1px 0 rgba(255,255,255,.05)),var(--glass-drop,0 8px 24px rgba(0,8,12,.22)),0 14px 44px rgba(0,0,0,.42);
         color:#d8d1bc;font:13px "IBM Plex Mono",Consolas,monospace}
       .point-charts-modal.show{display:flex;flex-direction:column}
       .point-charts-modal.expanded{position:fixed;inset:12px!important;width:auto!important;height:auto;max-width:none;max-height:none}
       .point-modal-head{display:flex!important;justify-content:space-between;align-items:flex-start;min-height:52px!important;
-        padding:8px 10px!important;border-bottom:1px solid #304b52!important;background:#081d25!important;
-        cursor:grab;user-select:none;touch-action:none}
+        padding:8px 10px!important;border-bottom:1px solid var(--glass-line,#304b52)!important;background:transparent!important;
+        cursor:grab;user-select:none;touch-action:none;gap:8px}
       .point-modal-head.dragging{cursor:grabbing}
+      .point-modal-head-left{min-width:0}
+      /* Was its own full-width row (.point-modal-shared-controls) below the
+         tab bar -- reported live as wasting vertical space for a single
+         dropdown. Lives in the header now, next to the export/expand/close
+         actions it's least likely to collide with for room. */
+      .point-modal-head-right{display:flex;align-items:center;gap:7px;flex:none}
       .point-modal-kicker{color:#68cf91;font-size:9px;letter-spacing:.13em}
       .point-modal-title{display:block;color:#d9c69e;font:600 17px "Barlow Condensed","Arial Narrow",sans-serif;letter-spacing:.05em}
       .point-modal-meta{color:#77949a;font-size:11px}
+      .point-modal-head-right select.point-modal-model{width:auto;max-width:150px;margin:0;padding:5px 6px;
+        border:1px solid #304b52;border-radius:0;background:#071820;color:#d8d1bc;
+        font:10px "IBM Plex Mono",monospace;text-overflow:ellipsis}
+      .point-modal-head-right select.point-modal-model.hidden{display:none}
       .point-modal-actions{display:flex;gap:5px}
       .point-modal-actions button{width:auto!important;margin:0!important;padding:5px 7px!important;border:1px solid #304b52!important;
         background:#102d35!important;color:#d8d1bc!important;border-radius:0!important;font:600 9px "IBM Plex Mono",monospace!important}
@@ -29,9 +42,6 @@ window.PointChartsModal = (() => {
         border-right:1px solid #304b52!important;border-radius:0!important;background:#071820!important;color:#77949a!important;
         font:600 9px "IBM Plex Mono",monospace!important;letter-spacing:.07em}
       .point-modal-tabs button.active{background:#102d35!important;color:#68cf91!important;box-shadow:inset 0 -2px #68cf91}
-      .point-modal-shared-controls{display:flex;padding:7px 9px;border-bottom:1px solid #304b52;background:#06171e}
-      .point-modal-shared-controls select{width:auto;min-width:0;max-width:170px;padding:5px 7px;border:1px solid #304b52;border-radius:0;
-        background:#071820;color:#d8d1bc;font:11px "IBM Plex Mono",monospace}
       .point-modal-body{display:flex;min-height:0;flex:1;padding:9px}
       .point-modal-view{display:none;min-width:0;min-height:0;flex:1}.point-modal-view.active{display:flex;flex-direction:column;gap:7px}
       .point-modal-select{width:100%;padding:6px 8px;border:1px solid #304b52;border-radius:0;background:#071820;color:#d8d1bc;
@@ -68,7 +78,31 @@ window.PointChartsModal = (() => {
         touch-action:none;background:linear-gradient(135deg,transparent 0 44%,#38575d 45% 51%,transparent 52% 62%,#68cf91 63% 69%,transparent 70%)}
       .point-charts-modal.expanded .point-modal-resize-handle{display:none}
       @media(max-width:720px){.point-charts-modal{left:8px!important;right:8px!important;top:8px!important;width:auto!important;
-        min-width:0;height:58vh}.point-modal-actions{flex-wrap:wrap;justify-content:flex-end}
+        min-width:0;height:58vh}
+        /* .point-modal-head-right keeps flex:none (its non-mobile rule,
+           above) so it never shrinks -- fine on desktop, but on mobile that
+           made head-right demand the header's full width while head-left
+           was still allowed to shrink (min-width:0, for the desktop case
+           where both sides share one row), so flexbox crushed head-left to
+           0 width instead of wrapping -- confirmed live: the title/coords
+           sat behind the model dropdown. flex-wrap here plus an explicit
+           100% basis on head-right forces head-right onto its own
+           full-width row below head-left instead of contesting it. */
+        .point-modal-head{flex-wrap:wrap}
+        .point-modal-head-left{flex:1 1 auto}
+        .point-modal-head-right{flex:1 1 100%;flex-wrap:nowrap;justify-content:flex-end;gap:5px}
+        /* Within that row, the select used to also claim flex:1 1 100% --
+           correct for keeping it off head-left's row, but it also meant the
+           select and the PNG/CSV/EXPAND/close actions each forced their own
+           line *inside* head-right, spending three rows total on a header
+           that only needs two -- reported live as "takes too much space".
+           nowrap above plus letting the select shrink (flex:1 1 auto,
+           min-width:0) puts both on head-right's one row instead, with the
+           select giving up width first since the action buttons have
+           actual labels to fit and it's fine to just truncate. */
+        .point-modal-head-right select.point-modal-model{max-width:none;flex:1 1 auto;min-width:0;width:0}
+        .point-modal-actions{flex:none;flex-wrap:nowrap;gap:3px}
+        .point-modal-actions button{padding:5px 5px!important;font-size:8px!important}
         .point-modal-tabs button{min-width:0;flex:1 1 0;padding:8px 6px!important;font-size:8px!important}}
     `;
     document.head.appendChild(style);
@@ -95,16 +129,19 @@ window.PointChartsModal = (() => {
     root.setAttribute("aria-label", "Location data inspector");
     root.innerHTML = `
       <header class="point-modal-head">
-        <div>
+        <div class="point-modal-head-left">
           <div class="point-modal-kicker">LOCATION OBSERVATORY</div>
           <strong class="point-modal-title">Select a point</strong>
           <span class="point-modal-meta"></span>
         </div>
-        <div class="point-modal-actions">
-          <button type="button" data-action="png" title="Export current chart as PNG">PNG</button>
-          <button type="button" data-action="csv" title="Export current chart as CSV">CSV</button>
-          <button type="button" data-action="expand" title="Expand chart">EXPAND</button>
-          <button type="button" data-action="close" title="Close">×</button>
+        <div class="point-modal-head-right">
+          <select class="point-modal-model" aria-label="Weather model"></select>
+          <div class="point-modal-actions">
+            <button type="button" data-action="png" title="Export current chart as PNG">PNG</button>
+            <button type="button" data-action="csv" title="Export current chart as CSV">CSV</button>
+            <button type="button" data-action="expand" title="Expand chart">EXPAND</button>
+            <button type="button" data-action="close" title="Close">×</button>
+          </div>
         </div>
       </header>
       <nav class="point-modal-tabs" aria-label="Location data views">
@@ -112,9 +149,6 @@ window.PointChartsModal = (() => {
         <button type="button" data-view="summary">SUMMARY</button>
         <button type="button" data-view="loaded" class="active">LOADED HERE <span data-loaded-count>0</span></button>
       </nav>
-      <div class="point-modal-shared-controls">
-        <select class="point-modal-model" aria-label="Weather model"></select>
-      </div>
       <div class="point-modal-body">
         <section class="point-modal-view point-chart-view">
           <div class="point-modal-controls">
@@ -180,6 +214,10 @@ window.PointChartsModal = (() => {
       activeView = views[view] ? view : "loaded";
       tabButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === activeView));
       Object.entries(views).forEach(([key, element]) => element.classList.toggle("active", key === activeView));
+      // The model choice only affects the Open-Meteo-driven Charts/Summary
+      // views -- "Loaded here" is just each feature's own raw attributes, so
+      // the selector doesn't apply there and was just clutter on that tab.
+      modelSelect.classList.toggle("hidden", activeView === "loaded");
       root.querySelectorAll('[data-action="png"],[data-action="csv"]').forEach((button) => {
         button.disabled = activeView !== "charts";
       });
@@ -228,7 +266,11 @@ window.PointChartsModal = (() => {
 
     function beginInteraction(event, type) {
       if (root.classList.contains("expanded") || event.button > 0) return;
-      if (type === "drag" && event.target.closest(".point-modal-actions")) return;
+      // .point-modal-head-right now also holds the model select (moved out
+      // of its own row into the header) -- was just .point-modal-actions,
+      // which no longer covers it, so opening the dropdown would have
+      // started a drag right along with it.
+      if (type === "drag" && event.target.closest(".point-modal-head-right")) return;
       event.preventDefault();
       const bounds = mount.getBoundingClientRect();
       const box = root.getBoundingClientRect();

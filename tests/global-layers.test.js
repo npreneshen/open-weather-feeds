@@ -148,8 +148,12 @@ for (const path of ["public/global-layers.js"]) {
     assert.equal(dolphin.lat, 25.9);
     assert.equal(dolphin.lon, 136.2);
     assert.equal(dolphin.classification, "Very Strong Typhoon");
-    assert.equal(dolphin.pressure, 0);
-    assert.equal(dolphin.movementDir, 0);
+    // JTWC (WP) rows leave MSLP/TCDIR/TCSPD at a plain 0 instead of NHC's
+    // 9999 sentinel when the field isn't reported -- 0 mb is never a real
+    // pressure, so these must come through as null, not a fake "0".
+    assert.equal(dolphin.pressure, null);
+    assert.equal(dolphin.movementDir, null);
+    assert.equal(dolphin.movementSpeed, null);
     const milton = items.get("cyclone-AL-14");
     assert.equal(milton.lat, -12.5);
     assert.equal(milton.classification, "Hurricane");

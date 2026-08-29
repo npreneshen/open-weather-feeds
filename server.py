@@ -25,7 +25,9 @@ API_BASES = {
     "cneos": "https://ssd-api.jpl.nasa.gov",
     "opensky": "https://opensky-network.org",
     "swpc": "https://services.swpc.noaa.gov",
-    "ncei": "https://gis.ngdc.noaa.gov",
+    # HazEL hazard-service; the old gis.ngdc.noaa.gov ArcGIS host stopped
+    # responding entirely (connects, then never returns a byte).
+    "ncei": "https://www.ngdc.noaa.gov",
     "nws": "https://api.weather.gov",
     "aviation": "https://aviationweather.gov",
     "openmeteoAq": "https://air-quality-api.open-meteo.com",
@@ -40,6 +42,13 @@ API_BASES = {
     "eonet": "https://eonet.gsfc.nasa.gov",
     "metno": "https://api.met.no",
     "nasaPower": "https://power.larc.nasa.gov",
+    # NASA DONKI solar flare / CME catalogues (see worker/index.js for why
+    # this is proxied rather than called direct from the browser).
+    "nasaDonki": "https://api.nasa.gov",
+    # Two-line element sets (keyless); see worker/index.js.
+    "tle": "https://tle.ivanstanojevic.me",
+    # Full SOHO/GOES imagery archive (keyless); see worker/index.js.
+    "helioviewer": "https://api.helioviewer.org",
     "coops": "https://api.tidesandcurrents.noaa.gov",
     "gdacs": "https://www.gdacs.org",
     "geomet": "https://api.weather.gc.ca",
@@ -47,6 +56,10 @@ API_BASES = {
     "arcgisCyclones": "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/Active_Hurricanes_v1",
     "arcgisImagery": "https://server.arcgisonline.com",
     "waybackConfig": "https://s3-us-west-2.amazonaws.com",
+    # EXPERIMENTAL -- scoped to this folder only. Only the metadata JSON
+    # needs proxying (no CORS headers on that endpoint, confirmed live);
+    # imagery tiles are plain <img> loads like Wayback's.
+    "rammbSlider": "https://slider.cira.colostate.edu",
 }
 # Mirrors the per-source userAgent overrides in worker/index.js's SOURCES table.
 SOURCE_USER_AGENTS = {
@@ -57,6 +70,12 @@ SOURCE_USER_AGENTS = {
     # for this host specifically (verified live) -- only a plain browser UA
     # gets through.
     "nws": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    # api.nasa.gov behaves the same way: 403 for our domain-styled UA, 200 for
+    # a browser one (verified live).
+    "nasaDonki": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    # tle.ivanstanojevic.me is stricter still -- it closes the connection
+    # outright (RemoteDisconnected) for our domain-styled UA.
+    "tle": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
 }
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "public")
 HOST = "127.0.0.1"
@@ -78,13 +97,48 @@ TTL_BY_SERVICE = {
     "openmeteoArchive": 3600, "openmeteoFlood": 3600, "openmeteoEnsemble": 300,
     "openmeteoGeocoding": 86400,
     "nominatim": 86400, "earthsearch": 300, "eonet": 300, "metno": 300,
-    "nasaPower": 3600, "coops": 60, "gdacs": 300, "geomet": 300,
+    "nasaPower": 3600, "nasaDonki": 1800, "tle": 3600, "helioviewer": 600, "coops": 60, "gdacs": 300, "geomet": 300,
     "brightsky": 300, "arcgisCyclones": 300, "arcgisImagery": 3600,
-    "waybackConfig": 86400,
+    "waybackConfig": 86400, "rammbSlider": 60,
 }
 _PROXY_CACHE = {}
 _PROXY_CACHE_LOCK = threading.Lock()
 _PROXY_CACHE_MAX = 500
+
+# Mirrors worker/index.js's eumetsatTile route: EUMETSAT's own GetMap
+# endpoint never sends CORS headers (confirmed live, repeatedly), which the
+# imagery-playback.js canvas pipeline needs for every EUMETSAT-hosted
+# satellite (Meteosat, MTG, Metop) -- see the worker route's comment for the
+# full story. Narrow by design: only these five GetMap params are ever
+# taken from the client, everything else is fixed here.
+EUMETSAT_WMS_BASE = "https://view.eumetsat.int/geoserver/wms"
+EUMETSAT_LAYER_RE = re.compile(r"^(mtg_fd|msg_fes|msg_rss|msg_iodc|eps):[a-z0-9_]+$")
+EUMETSAT_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+EUMETSAT_MAX_TILE_BYTES = 8 * 1024 * 1024
+
+# EXPERIMENTAL -- CIRA/RAMMB's tile-grid stitch (cira-picker.js) draws
+# fetched tiles onto a <canvas> and exports it via toBlob() for playback/GIF
+# export. slider.cira.colostate.edu sends no Access-Control-Allow-Origin
+# (confirmed live, same story as EUMETSAT above) -- without it, drawing a
+# cross-origin image taints the canvas and toBlob() throws. Same fix: proxy
+# the tile server-side and add the header ourselves. Every param is
+# whitelisted/pattern-matched against the real catalog (public/rammb-
+# catalog.json), not passed through as an arbitrary URL, to keep this from
+# becoming an open image-fetching proxy.
+CIRA_SATELLITE_RE = re.compile(r"^(goes-19|goes-18|himawari|gk2a|meteosat-9|meteosat-0deg|meteosat-12|jpss)$")
+CIRA_SECTOR_RE = re.compile(r"^[a-z0-9_]+$")
+CIRA_PRODUCT_RE = re.compile(r"^[a-z0-9_]+$")
+CIRA_TIMESTAMP_RE = re.compile(r"^\d{14}$")
+CIRA_MAX_TILE_BYTES = 8 * 1024 * 1024
+
+# Same story, different upstream: api.helioviewer.org's downloadImage
+# endpoint sends no Access-Control-Allow-Origin either (confirmed live,
+# unlike services.swpc.noaa.gov's animation images, which already do and so
+# need no proxy) -- GIF/PNG/ZIP export of a space-weather "History" (3d/7d)
+# sequence would taint the canvas without this. id is Helioviewer's own
+# opaque numeric image id (from getClosestImage), not user-authored.
+HELIOVIEWER_ID_RE = re.compile(r"^\d+$")
+HELIOVIEWER_MAX_TILE_BYTES = 8 * 1024 * 1024
 
 
 def _cache_get(key):
@@ -156,7 +210,197 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if path == "/api/tiles/eumetsat":
+            self._handle_eumetsat_tile()
+            return
+        if path == "/api/tiles/cira":
+            self._handle_cira_tile()
+            return
+        if path == "/api/tiles/helioviewer":
+            self._handle_helioviewer_image()
+            return
         super().do_GET()
+
+    def _handle_eumetsat_tile(self):
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+
+        def one(name, default=""):
+            return (query.get(name) or [default])[0]
+
+        layers = one("layers")
+        time_param = one("time")
+        bbox = one("bbox")
+        crs = one("crs", "EPSG:3857")
+        try:
+            width = int(one("width", "256"))
+            height = int(one("height", "256"))
+        except ValueError:
+            self._json(400, {"error": {"message": "Invalid width/height"}})
+            return
+        if not EUMETSAT_LAYER_RE.fullmatch(layers):
+            self._json(400, {"error": {"message": "Invalid layers"}})
+            return
+        if not EUMETSAT_TIME_RE.fullmatch(time_param):
+            self._json(400, {"error": {"message": "Invalid time"}})
+            return
+        try:
+            bbox_nums = [float(v) for v in bbox.split(",")]
+            if len(bbox_nums) != 4:
+                raise ValueError
+        except ValueError:
+            self._json(400, {"error": {"message": "Invalid bbox"}})
+            return
+        if crs not in ("EPSG:3857", "EPSG:4326"):
+            self._json(400, {"error": {"message": "Invalid crs"}})
+            return
+        # 1600 (not 512) since the playback tool's "single image" request
+        # method -- one WMS GetMap covering a whole satellite disc, see
+        # imagery-playback.js's captureSingleImageWmsFrame -- asks for up to
+        # SINGLE_IMAGE_SIZE (1536) on its long edge, not just a 256px tile.
+        if not (1 <= width <= 1600 and 1 <= height <= 1600):
+            self._json(400, {"error": {"message": "Invalid width/height"}})
+            return
+
+        params = {
+            "service": "WMS", "request": "GetMap", "layers": layers, "styles": "",
+            "format": "image/png", "transparent": "true", "version": "1.3.0",
+            "width": str(width), "height": str(height), "crs": crs, "bbox": bbox, "time": time_param,
+        }
+        url = f"{EUMETSAT_WMS_BASE}?{urllib.parse.urlencode(params)}"
+        try:
+            request = urllib.request.Request(url, headers={"Accept": "image/png,image/*"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                data = response.read()
+                content_type = response.headers.get("Content-Type") or "image/png"
+        except urllib.error.HTTPError as exc:
+            self._json(502, {"error": {"message": f"EUMETSAT returned HTTP {exc.code}"}})
+            return
+        except urllib.error.URLError as exc:
+            self._json(502, {"error": {"message": str(exc.reason)}})
+            return
+        if len(data) > EUMETSAT_MAX_TILE_BYTES:
+            self._json(502, {"error": {"message": "Upstream response is too large"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_cira_tile(self):
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+
+        def one(name, default=""):
+            return (query.get(name) or [default])[0]
+
+        satellite = one("satellite")
+        sector = one("sector")
+        product = one("product")
+        timestamp = one("timestamp")
+        zoom = one("zoom")
+        row = one("row")
+        col = one("col")
+        if not CIRA_SATELLITE_RE.fullmatch(satellite):
+            self._json(400, {"error": {"message": "Invalid satellite"}})
+            return
+        if not CIRA_SECTOR_RE.fullmatch(sector):
+            self._json(400, {"error": {"message": "Invalid sector"}})
+            return
+        if not CIRA_PRODUCT_RE.fullmatch(product):
+            self._json(400, {"error": {"message": "Invalid product"}})
+            return
+        if not CIRA_TIMESTAMP_RE.fullmatch(timestamp):
+            self._json(400, {"error": {"message": "Invalid timestamp"}})
+            return
+        try:
+            zoom_n = int(zoom)
+            row_n = int(row)
+            col_n = int(col)
+            if not (0 <= zoom_n <= 9 and 0 <= row_n <= 511 and 0 <= col_n <= 511):
+                raise ValueError
+        except ValueError:
+            self._json(400, {"error": {"message": "Invalid zoom/row/col"}})
+            return
+
+        year, month, day = timestamp[0:4], timestamp[4:6], timestamp[6:8]
+        url = (
+            f"https://slider.cira.colostate.edu/data/imagery/{year}/{month}/{day}/"
+            f"{satellite}---{sector}/{product}/{timestamp}/{zoom_n:02d}/{row_n:03d}_{col_n:03d}.png"
+        )
+        try:
+            # 60s, not 15 -- confirmed live (both through this proxy and
+            # fetching CIRA directly, bypassing us entirely) that a single
+            # tile at zoom > 0 can take 40-50s from CIRA's own server right
+            # now, not just at the higher end of what looked like normal
+            # variance. 15s meant most tiles for any resolution above
+            # Standard were silently timing out and getting dropped as
+            # "missing" (stitchFrame's per-tile catch), which is what "the
+            # other resolutions don't seem to load" actually was -- zoom 0
+            # (one tile) usually snuck under 15s, zoom 1+ (several tiles,
+            # all needing to succeed) usually didn't.
+            request = urllib.request.Request(url, headers={"Accept": "image/png,image/*"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = response.read()
+                content_type = response.headers.get("Content-Type") or "image/png"
+        except urllib.error.HTTPError as exc:
+            self._json(exc.code if exc.code in (404,) else 502, {"error": {"message": f"CIRA returned HTTP {exc.code}"}})
+            return
+        except urllib.error.URLError as exc:
+            self._json(502, {"error": {"message": str(exc.reason)}})
+            return
+        if len(data) > CIRA_MAX_TILE_BYTES:
+            self._json(502, {"error": {"message": "Upstream response is too large"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=60")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_helioviewer_image(self):
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+
+        def one(name, default=""):
+            return (query.get(name) or [default])[0]
+
+        image_id = one("id")
+        width = one("width", "512")
+        if not HELIOVIEWER_ID_RE.fullmatch(image_id):
+            self._json(400, {"error": {"message": "Invalid id"}})
+            return
+        try:
+            width_n = int(width)
+            if not (64 <= width_n <= 1024):
+                raise ValueError
+        except ValueError:
+            self._json(400, {"error": {"message": "Invalid width"}})
+            return
+
+        url = f"https://api.helioviewer.org/v2/downloadImage/?id={image_id}&width={width_n}"
+        try:
+            request = urllib.request.Request(url, headers={"Accept": "image/png,image/*"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                data = response.read()
+                content_type = response.headers.get("Content-Type") or "image/png"
+        except urllib.error.HTTPError as exc:
+            self._json(502, {"error": {"message": f"Helioviewer returned HTTP {exc.code}"}})
+            return
+        except urllib.error.URLError as exc:
+            self._json(502, {"error": {"message": str(exc.reason)}})
+            return
+        if len(data) > HELIOVIEWER_MAX_TILE_BYTES:
+            self._json(502, {"error": {"message": "Upstream response is too large"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
@@ -220,27 +464,54 @@ class Handler(SimpleHTTPRequestHandler):
         # particular throttles in short rolling windows, so a request that
         # lands ~1.5s later after a burst (e.g. the several sub-services one
         # point click fires at once) commonly succeeds instead of surfacing
-        # a rate-limit error to the user.
+        # a rate-limit error to the user. Also covers 502/503/504: a "service
+        # unavailable" seen once on USGS waterservices and gone on the very
+        # next toggle is a transient upstream hiccup, just as retryable as
+        # a 429. A plain timeout (or any other connection-level failure --
+        # urlopen raises URLError, not HTTPError, for those) used to skip
+        # this retry entirely and report immediately -- confirmed live as
+        # "timed out" on USGS waterservices with no second attempt, even
+        # though a bare timeout is the least ambiguous "transient upstream
+        # hiccup" of the bunch. Retrying it the same way closes that gap.
         retry_delays = (0, 1.5)
+        retryable_status = (429, 502, 503, 504)
         for attempt, delay in enumerate(retry_delays):
             if delay:
                 time.sleep(delay)
             try:
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     raw = resp.read().decode(errors="replace")
-                    if want_text or not raw.lstrip().startswith(("{", "[")):
+                    looks_like_json = raw.lstrip().startswith(("{", "["))
+                    if want_text or not looks_like_json:
                         payload = {"raw": raw}
                     else:
                         try:
                             payload = json.loads(raw)
                         except json.JSONDecodeError:
                             payload = {"raw": raw}
-                    if ttl and 200 <= resp.status < 300:
+                            looks_like_json = False
+                    # A 200 status whose body isn't actually JSON when JSON
+                    # was expected (confirmed live: archive-api.open-meteo.com
+                    # occasionally returns a plain-text upstream error --
+                    # "Unexpected error while streaming data:
+                    # fileModifiedOrPrevalidationFailed" -- with a 200 status
+                    # instead of a real error code, for this app's normal
+                    # 46-hourly/52-daily-variable point-history request) used
+                    # to get cached as if it were a genuine successful
+                    # payload, so that one bad reply then kept coming back
+                    # from OUR OWN cache for the rest of its TTL (up to an
+                    # hour for openmeteoArchive) instead of the next real
+                    # request just working. Retrying it the same way as a
+                    # 502/503/504, and never caching it, closes that gap.
+                    if not want_text and not looks_like_json:
+                        if attempt < len(retry_delays) - 1:
+                            continue
+                    elif ttl and 200 <= resp.status < 300:
                         _cache_put(url, ttl, resp.status, payload)
                     self._json(resp.status, payload)
                 break
             except urllib.error.HTTPError as e:
-                if e.code == 429 and attempt < len(retry_delays) - 1:
+                if e.code in retryable_status and attempt < len(retry_delays) - 1:
                     continue
                 raw = e.read().decode(errors="replace")
                 try:
@@ -254,6 +525,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(e.code, payload)
                 break
             except urllib.error.URLError as e:
+                if attempt < len(retry_delays) - 1:
+                    continue
                 self._json(502, {"error": {"message": str(e.reason)}})
                 break
 

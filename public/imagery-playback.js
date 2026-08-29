@@ -41,44 +41,56 @@ window.MetisImageryPlayback = (() => {
   // Alpha-capable providers keep gaining pixels from each fallback request,
   // so they are only considered finished once a tile is essentially full.
   const TILE_FULL_COVERAGE = 0.985;
-  const SENTINEL_MAX_WINDOW_DAYS = 60;
+  // Captured frames are kept TRANSPARENT wherever the provider returned no
+  // data, so the on-screen playback overlay lets the basemap (coastlines,
+  // borders, place names) show through exactly like the live map does --
+  // painting this behind every frame instead made the uncovered part of a
+  // satellite disc a flat dark-teal slab that hid the map, which is the
+  // "why does the empty area turn blue in playback" report. The fill is
+  // still applied, but only when flattening a frame for export (GIF has no
+  // useful alpha, and a transparent PNG of a satellite frame reads as
+  // broken), via flattenForExport below.
   const BACKGROUND_FILL = "#06171e";
+  // Long edge of the single big GetMap fetched for a geoWmsInfo-family
+  // layer (Meteosat/MTG/Metop) when that satellite's "Single image" request
+  // method is on -- see captureSingleImageWmsFrame below and the matching
+  // live-map path in map-overlays.js's buildSingleImageWmsLayer. Routed
+  // through the worker's /api/tiles/eumetsat proxy (this pipeline needs
+  // real pixel access, unlike the live map's plain <img> tiles), whose
+  // width/height cap was raised alongside this to fit it.
+  const SINGLE_IMAGE_SIZE = 1536;
+  // Largest side captureViewWmsFrame will ask the proxy for -- must stay at or
+  // under server.py/_handle_eumetsat_tile's own 1600 limit. A view bigger than
+  // this falls back to the tile grid rather than being fetched downscaled.
+  const SINGLE_VIEW_MAX_PX = 1600;
 
+  // "family" scopes gapFillPlan()'s sibling substitution below -- without it,
+  // adding nightlights here would let a gap in it get filled from a daytime
+  // true-colour sibling (or vice versa), compositing two unrelated kinds of
+  // imagery together. Only same-family entries are ever offered as a
+  // gap-fill source for each other.
   const GIBS_PRODUCTS = {
-    satellite: {
-      layer: "MODIS_Terra_CorrectedReflectance_TrueColor",
-      level: "GoogleMapsCompatible_Level9",
-      maxNativeZoom: 9,
-      ext: "jpg",
-      label: "NASA GIBS Terra true-colour",
-    },
-    satelliteAqua: {
-      layer: "MODIS_Aqua_CorrectedReflectance_TrueColor",
-      level: "GoogleMapsCompatible_Level9",
-      maxNativeZoom: 9,
-      ext: "jpg",
-      label: "NASA GIBS Aqua true-colour",
-    },
-    satelliteViirs: {
-      layer: "VIIRS_SNPP_CorrectedReflectance_TrueColor",
-      level: "GoogleMapsCompatible_Level9",
-      maxNativeZoom: 9,
-      ext: "jpg",
-      label: "NASA GIBS VIIRS/SNPP true-colour",
-    },
-    satelliteNoaa20: {
-      layer: "VIIRS_NOAA20_CorrectedReflectance_TrueColor",
-      level: "GoogleMapsCompatible_Level9",
-      maxNativeZoom: 9,
-      ext: "jpg",
-      label: "NASA GIBS VIIRS/NOAA-20 true-colour",
-    },
-    satelliteNoaa21: {
-      layer: "VIIRS_NOAA21_CorrectedReflectance_TrueColor",
-      level: "GoogleMapsCompatible_Level9",
-      maxNativeZoom: 9,
-      ext: "jpg",
-      label: "NASA GIBS VIIRS/NOAA-21 true-colour",
+    // satellite/satelliteAqua/satelliteViirs/satelliteNoaa20/satelliteNoaa21
+    // used to be fixed true-colour-only entries here; the satellite AND
+    // product both now live in MetisDailySat (daily-satellite-picker.js),
+    // resolved dynamically below in tileUrlFor/maxNativeZoom lookup, the
+    // same way geoWmsInfo() already does for the GOES/Meteosat/MTG family --
+    // so a product change there (e.g. VIIRS SNPP -> Night Lights) is picked
+    // up here too instead of silently staying on true-colour.
+    // NOAA-20's Day/Night Band, not SNPP's -- confirmed live against GIBS'
+    // own GetCapabilities that SNPP's DayNightBand_ENCC stopped updating in
+    // mid-2023 (its `default` still resolves to 2023, a current date 404s),
+    // while NOAA-20's `default` resolves to today. Grayscale radiance data,
+    // not a colourized composite (pixel-verified: every PLTE palette entry
+    // has R=G=B) -- NASA's colourized "Black Marble" is a separate, only-
+    // annually-updated product, not usable for daily playback.
+    nightlights: {
+      layer: "VIIRS_NOAA20_DayNightBand",
+      level: "GoogleMapsCompatible_Level7",
+      maxNativeZoom: 7,
+      ext: "png",
+      label: "NASA GIBS VIIRS/NOAA-20 nighttime lights",
+      family: "nightlights",
     },
   };
 
@@ -203,19 +215,75 @@ window.MetisImageryPlayback = (() => {
   // from eclipse/maintenance periods -- missed slots just 404 and get
   // skipped like any other failed tile). Rounds each step down to the
   // nearest 10 min since that's the native grid GIBS actually publishes on.
-  function timeRange(hoursBack, intervalMinutes) {
+  // latestSlotMs, if given, overrides the blind "-20min" guess below with an
+  // actually-confirmed real slot (see resolveLatestGoesSlot) so the last
+  // frame in a playback sequence matches what the live map's literal
+  // "default" URL resolves to, instead of trailing it by however far off the
+  // blind guess happened to land.
+  // periodMinutes is the provider's REAL publish cadence for this layer, not
+  // a display preference. It defaults to GIBS' 10-minute GOES grid, but
+  // EUMETSAT's layers each declare their own in GetCapabilities and they are
+  // wildly different -- measured live: Metop PT1H40M (a ~100-min polar
+  // orbit), Meteosat PT15M, MTG PT10M, OSI SAF SST PT12H. Since those
+  // Dimensions also declare nearestValue="1", every request inside one
+  // period snaps onto the SAME scene, so stepping a 100-minute feed by the
+  // UI's 10-minute interval returns the identical image repeatedly (measured:
+  // 7 frames at 10-min steps = 1 distinct image; at 100-min steps = 3). Two
+  // consequences, both handled below: the step is rounded UP to a whole
+  // period, and a confirmed real slot is used EXACTLY rather than being
+  // re-rounded onto a 10-minute wall-clock grid it was never on (Metop's
+  // slots are orbit phase -- 12:07Z, not 12:00Z).
+  function timeRange(hoursBack, intervalMinutes, latestSlotMs, periodMinutes) {
+    const period = Math.max(1, Math.round(periodMinutes || 10));
+    const periodMs = period * 60000;
+    // Never step finer than the provider actually publishes, and always land
+    // on a whole multiple of it so every frame is a genuinely distinct scene.
+    const requestedMs = Math.max(period, intervalMinutes | 0) * 60000;
+    const stepMs = Math.max(1, Math.round(requestedMs / periodMs)) * periodMs;
+    // A confirmed slot (GetCapabilities' `default`, or resolveLatestGoesSlot's
+    // pixel-verified probe) is a real published timestamp -- use it as-is.
+    // Only the blind fallback needs snapping to the grid, and GIBS' newest
+    // GOES slot commonly trails wall-clock by 10-20 min, so it starts two
+    // slots behind to avoid an HTTP-200 white placeholder. Requesting ahead
+    // of the real latest is not harmless: EUMETSAT answers a future TIME with
+    // a slow HTTP 502, not a quick 404, so a wrong anchor costs minutes of
+    // gateway timeouts across every tile of every frame.
+    const anchor = latestSlotMs != null
+      ? latestSlotMs
+      : Math.floor((Date.now() - 20 * 60000) / periodMs) * periodMs;
+    const span = Math.max(1, hoursBack | 0) * 3600000;
+    const count = Math.max(1, Math.floor(span / stepMs) + 1);
     const times = [];
-    const stepMs = Math.max(10, intervalMinutes | 0) * 60000;
-    // GIBS' newest GOES slot commonly trails wall-clock time by 10–20 min.
-    // Starting two slots behind avoids requesting an HTTP-200 white
-    // placeholder while the latest image is still being published.
-    const nowRounded = Math.floor((Date.now() - 20 * 60000) / 600000) * 600000;
-    const start = nowRounded - Math.max(1, hoursBack | 0) * 3600000;
-    for (let t = start; t <= nowRounded; t += stepMs) {
-      const rounded = Math.floor(t / 600000) * 600000;
-      times.push(`${new Date(rounded).toISOString().slice(0, 16)}:00Z`);
+    for (let i = count - 1; i >= 0; i--) {
+      times.push(`${new Date(anchor - i * stepMs).toISOString().slice(0, 16)}:00Z`);
     }
     return times;
+  }
+
+  // Probes backward from the true latest possible 10-min slot (no blind
+  // buffer) and checks *actual pixel content* -- reusing sampleCanvasStats,
+  // the same blank check the frame-capture pipeline already does -- because
+  // a not-yet-published GIBS slot returns a real HTTP 200 with a blank
+  // placeholder image, not a 404, so a status-code probe can't tell them
+  // apart. Stops at the first confirmed-real slot; gives up after 5 tries
+  // (50 minutes) and falls back to the old conservative guess rather than
+  // returning an unconfirmed "now".
+  async function resolveLatestGoesSlot(gibsLayer, maxNativeZoom, signal) {
+    for (let back = 0; back < 5; back++) {
+      if (signal?.aborted) throw new Error("Cancelled");
+      const roundedMs = Math.floor((Date.now() - back * 600000) / 600000) * 600000;
+      const iso = `${new Date(roundedMs).toISOString().slice(0, 16)}:00Z`;
+      const url = `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/${gibsLayer}/default/${iso}/GoogleMapsCompatible_Level${maxNativeZoom}/2/1/1.png`;
+      try {
+        const img = await loadImage(url, signal);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || 256;
+        canvas.height = img.naturalHeight || 256;
+        canvas.getContext("2d").drawImage(img, 0, 0);
+        if (!sampleCanvasStats(canvas).blank) return roundedMs;
+      } catch { /* try an earlier slot */ }
+    }
+    return Math.floor((Date.now() - 20 * 60000) / 600000) * 600000;
   }
 
   function sampleCanvasStats(canvas) {
@@ -243,6 +311,19 @@ window.MetisImageryPlayback = (() => {
     return { blank: n > 0 && (dark / n > 0.98 || renderedError), coverage, renderedError };
   }
 
+  // Leaflet's own tile layers wrap tile columns around the world, so a view
+  // panned across the antimeridian (worldCopyJump leaves the map showing
+  // longitudes outside -180..180) still renders imagery everywhere on
+  // screen. The capture loops used to clamp tile X into [0, 2^z-1] instead,
+  // which silently DROPPED every column outside that range and left that
+  // slice of the frame transparent -- the reported "only part of the screen
+  // gets fetched, the left side is unchanged". Columns wrap; rows do not,
+  // since there is no world above the pole.
+  function wrapTileX(tx, z) {
+    const n = 2 ** z;
+    return ((tx % n) + n) % n;
+  }
+
   function frameFingerprint(canvas) {
     const probe = document.createElement("canvas");
     probe.width = FINGERPRINT_GRID;
@@ -258,12 +339,92 @@ window.MetisImageryPlayback = (() => {
     return gray;
   }
 
+  // Cell-by-cell comparison of two frameFingerprint() grids: a cell counts
+  // as "changed" only past CELL_DIFF_THRESHOLD of grayscale difference (so
+  // ordinary compression noise between two identical-looking PNGs doesn't
+  // register as a difference), and the two frames count as the same real
+  // scene only when fewer than DUPLICATE_CHANGED_FRAC of all cells changed.
+  // Used by loadFrames' Metop dedup pass below -- see enumStepDivisor.
+  function framesLookIdentical(fpA, fpB) {
+    if (!fpA || !fpB || fpA.length !== fpB.length) return false;
+    let changed = 0;
+    for (let i = 0; i < fpA.length; i++) {
+      if (Math.abs(fpA[i] - fpB[i]) > CELL_DIFF_THRESHOLD) changed++;
+    }
+    return changed / fpA.length < DUPLICATE_CHANGED_FRAC;
+  }
+
+  // Metop shares the same EUMETSAT WMS host/mechanism as Meteosat/MTG above
+  // (transparent PNG, time-dimension with nearestValue snapping) -- just a
+  // different picker module (metop-picker.js, keyed by satellite id rather
+  // than the geostationary family's per-disk ids), so every place below that
+  // asks "is this a geostationary-style WMS/WMTS satellite" also has to ask
+  // MetisMetop, not just MetisGeoSat. Centralised here so that only needs
+  // saying once.
+  function geoWmsInfo(layerId) {
+    if (window.MetisGeoSat?.SATELLITES[layerId]) {
+      return { ...window.MetisGeoSat.layerInfo(layerId), family: "geosat" };
+    }
+    if (window.MetisMetop?.SATELLITES[layerId]) {
+      const info = window.MetisMetop.layerInfo(layerId);
+      return info ? { ...info, type: "wms", maxNativeZoom: 12, family: "metop" } : null;
+    }
+    // SST (OSI SAF) is a global gridded composite, not tied to any one
+    // satellite -- metop-picker.js's sstLayerInfo() has no satLabel/
+    // productLabel the way layerInfo(satId) does, so those are filled in
+    // here for the layerLabel/gap-fill-note plumbing that expects them.
+    if (layerId === "metopSst" && window.MetisMetop?.sstLayerInfo) {
+      const info = window.MetisMetop.sstLayerInfo();
+      return info
+        ? { ...info, type: "wms", maxNativeZoom: 12, family: "metopSst", satLabel: "Metop OSI SAF", productLabel: "Sea Surface Temperature" }
+        : null;
+    }
+    return null;
+  }
+
+  // Whether captureFrame should fetch one big WMS image instead of tiling
+  // this layer, and if so what geographic extent that image should cover --
+  // shares the same "Single image" toggle (and, for geostationary, the same
+  // per-satellite viewing bbox) as the live map's build() in map-overlays.js,
+  // via requestMode()/viewBbox() on the same picker modules. Metop's own
+  // coverage is already global (its GetCapabilities BoundingBox is a plain
+  // -180..180/-90..90), so it always gets the whole-globe bbox regardless of
+  // which one satellite/product the playback dropdown has selected.
+  function singleImageBboxFor(layerId) {
+    const info = geoWmsInfo(layerId);
+    if (!info || info.type !== "wms") return null;
+    if (info.family === "geosat") {
+      if (window.MetisGeoSat?.requestMode?.() !== "single") return null;
+      return window.MetisGeoSat.viewBbox(layerId);
+    }
+    if (info.family === "metop" || info.family === "metopSst") {
+      if (window.MetisMetop?.requestMode?.() !== "single") return null;
+      return { west: -180, south: -90, east: 180, north: 90 };
+    }
+    return null;
+  }
+
+  function singleImageWmsUrl(wmsLayer, bbox, time) {
+    const height = Math.round(SINGLE_IMAGE_SIZE * ((bbox.north - bbox.south) / (bbox.east - bbox.west)));
+    const params = new URLSearchParams({
+      layers: wmsLayer, width: String(SINGLE_IMAGE_SIZE), height: String(height),
+      crs: "EPSG:4326",
+      // WMS 1.3.0 + EPSG:4326 mandates lat,lon (south,west,north,east) axis
+      // order, not the lon,lat order used everywhere else in this app --
+      // see the matching comment on buildSingleImageWmsLayer in
+      // map-overlays.js for how this was confirmed (the wrong order still
+      // returns a real 200, just visibly wrong/stretched content).
+      bbox: `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`, time,
+    });
+    return `/api/tiles/eumetsat?${params.toString()}`;
+  }
+
   // Providers that publish transparent PNGs mark missing data with alpha 0, so
   // a partially covered tile can be completed pixel-by-pixel from a second
   // request. JPEG products (GIBS true colour, EOX, Esri) bake no-data in as
   // pure black, so for those only a whole tile can be substituted.
   function providerUsesAlpha(layerId) {
-    return layerId === "sentinelhub" || !!window.MetisGeoSat?.SATELLITES[layerId];
+    return layerId === "sentinelhub" || !!geoWmsInfo(layerId);
   }
 
   // Fraction of sampled pixels carrying real imagery. Thresholds are
@@ -351,40 +512,56 @@ window.MetisImageryPlayback = (() => {
     return `${new Date(rounded).toISOString().slice(0, 16)}:00Z`;
   }
 
+  // GEOS_IRX (NSMC's global geostationary IR mosaic) is hourly, not the
+  // 10-min grid GOES/Himawari/Meteosat publish on -- its own time-range and
+  // slot-shift both work in whole hours instead.
+  function geosmosaicTimeRange(hoursBack, intervalMinutes) {
+    const times = [];
+    const stepMs = Math.max(60, intervalMinutes | 0) * 60000;
+    // Mirrors the live layer's own freshness fix (see map-overlays.js): the
+    // current UTC hour's composite is regularly still assembling (confirmed
+    // live -- a ~1KB near-empty PNG well into the hour, vs ~170KB+ for a
+    // finished one), so the newest hour ever requested is always the one
+    // before "now", never the current one.
+    const latestHour = Math.floor(Date.now() / 3600000) * 3600000 - 3600000;
+    const start = latestHour - Math.max(1, hoursBack | 0) * 3600000;
+    for (let t = start; t <= latestHour; t += stepMs) {
+      const hour = Math.floor(t / 3600000) * 3600000;
+      times.push(`${new Date(hour).toISOString().slice(0, 13)}:00:00Z`);
+    }
+    return times;
+  }
+
+  function shiftGeosmosaicHour(iso, hoursBack) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return iso;
+    const shifted = Math.floor((t - hoursBack * 3600000) / 3600000) * 3600000;
+    return `${new Date(shifted).toISOString().slice(0, 13)}:00:00Z`;
+  }
+
+  function geosmosaicImageUrl(iso) {
+    const datetime = `${iso.slice(0, 13).replace(/[-T]/g, "")}00`;
+    return `https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/compose?layers=GEOS_IRX&datetime=${datetime}&request=GetMap&bbox=-180,-90,180,90&width=1440&height=720&version=1.1.0&srs=EPSG:4326&format=png`;
+  }
+
   // Ordered extra requests to try for tiles the primary request left empty.
   // Each provider degrades along its own natural axis: Sentinel widens the
   // scene-search window and then drops the cloud cap, GIBS true colour falls
   // back to the other daily sensors, GOES steps back through 10-minute slots,
   // and EOX steps back a yearly composite.
   function gapFillPlan(layerId, windowDays) {
+    // Single source of truth lives in sentinel-hub.js now, shared with the
+    // live map layer's own gap-fill (SentinelGapFillTileLayer in
+    // map-overlays.js) so the two never drift apart again.
     if (layerId === "sentinelhub") {
-      const base = Math.max(1, windowDays | 0);
-      const plan = [];
-      const seen = new Set([base]);
-      // Cheapest attempt first: some WMS layers (confirmed live: an official
-      // Landsat template) don't resolve a start/end TIME range the way
-      // Sentinel-2 does -- a range collapses to almost nothing regardless
-      // of how wide it is, while a bare single date returns the real scene.
-      // Try that before spending requests widening a window that testing
-      // showed makes no difference for layers with this behavior.
-      plan.push({ singleDate: true, label: "exact date, no search window" });
-      for (const days of [base * 2, base * 4, SENTINEL_MAX_WINDOW_DAYS]) {
-        const w = Math.min(SENTINEL_MAX_WINDOW_DAYS, Math.round(days));
-        if (w > base && !seen.has(w)) {
-          seen.add(w);
-          plan.push({ windowDays: w, label: `${w}-day search window` });
-        }
-      }
-      plan.push({
-        windowDays: SENTINEL_MAX_WINDOW_DAYS,
-        maxcc: 100,
-        label: `${SENTINEL_MAX_WINDOW_DAYS}-day window, cloud cap lifted`,
+      return window.MetisSentinelHub.gapFillPlan(windowDays, {
+        priority: window.MetisApiKeys?.priorityFor("sentinelhub"),
       });
-      return plan;
     }
     if (GIBS_PRODUCTS[layerId]) {
+      const family = GIBS_PRODUCTS[layerId].family;
       return Object.keys(GIBS_PRODUCTS)
-        .filter((id) => id !== layerId)
+        .filter((id) => id !== layerId && GIBS_PRODUCTS[id].family === family)
         .map((id) => ({ siblingLayer: id, label: GIBS_PRODUCTS[id].label }));
     }
     if (window.MetisGeoSat?.SATELLITES[layerId]) {
@@ -394,6 +571,21 @@ window.MetisImageryPlayback = (() => {
       // cadence -- no separate step size needed per provider.
       return [10, 20, 30, 60].map((minutes) => ({ shiftMinutes: minutes, label: `${minutes} min earlier` }));
     }
+    if (window.MetisMetop?.SATELLITES[layerId]) {
+      // Same nearestValue-snapping WMS, but Metop is polar-orbiting with a
+      // ~100 min repeat cadence (its own Dimension declares PT1H40M) -- the
+      // geostationary family's 10/20/30/60-minute shifts would almost always
+      // resolve back to the exact same orbit pass, finding nothing. Step in
+      // whole-orbit multiples instead (1, 2, 3, 6 orbits back) so each
+      // attempt actually lands on a different real pass.
+      return [100, 200, 300, 600].map((minutes) => ({ shiftMinutes: minutes, label: `${Math.round(minutes / 100)} orbit${minutes > 100 ? "s" : ""} earlier` }));
+    }
+    if (layerId === "metopSst") {
+      // Global gridded composite updating roughly every 12h (per metop-
+      // picker.js) -- shift in half/full/multi-day steps instead of
+      // Metop's own orbit-scale ones.
+      return [12, 24, 36, 72].map((hours) => ({ shiftMinutes: hours * 60, label: `${hours}h earlier` }));
+    }
     if (layerId === "s2cloudless") {
       return [1, 2].map((yearsBack) => ({ yearsBack, label: `${yearsBack}y earlier composite` }));
     }
@@ -401,6 +593,20 @@ window.MetisImageryPlayback = (() => {
   }
 
   function create({ map, rasterOverlays }) {
+    // Capture the FULL map container, not just the strip between the panels.
+    // The map spans the whole window with the header and both side panels
+    // floating on top of it, and every one of those surfaces is translucent
+    // glass -- the map really is visible through them. An earlier version
+    // inset the capture by each panel's width to avoid fetching tiles for
+    // "hidden" area, but nothing there is actually hidden: the panels then
+    // showed LIVE map through the glass while the middle of the screen
+    // showed the playback frame, so the seam sat right at each panel edge.
+    // Framing the whole container keeps the frame continuous under all the
+    // chrome, and makes GIF/PNG exports full-screen instead of carrying a
+    // panel-shaped notch. It costs roughly double the tiles per frame; that
+    // is the deliberate price of the glass panels showing real imagery.
+    const captureBounds = () => map.getBounds();
+
     const frameCache = new Map(); // date -> { canvas, meta }
     let playTimer = null;
     let playIndex = 0;
@@ -409,6 +615,10 @@ window.MetisImageryPlayback = (() => {
     let currentDates = [];
     let overlayCanvas = null;
     let capturedBounds = null;
+    // Exact projected geometry of the current capture, so exports can build a
+    // matching basemap underlay (see ensureBasemapCanvas).
+    let captureGeometry = null;
+    let basemapCanvas = null;
     let overlayOpacity = 1;
     let loadController = null;
     const tileCache = new Map(); // url -> HTMLImageElement
@@ -465,9 +675,14 @@ window.MetisImageryPlayback = (() => {
       if (gibs) {
         return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/${gibs.layer}/default/${date}/${gibs.level}/${z}/${y}/${x}.${gibs.ext}`;
       }
-      if (window.MetisGeoSat?.SATELLITES[layerId]) {
-        const info = window.MetisGeoSat.layerInfo(layerId);
+      if (window.MetisDailySat?.SATELLITES[layerId]) {
+        const info = window.MetisDailySat.layerInfo(layerId);
         if (!info) return null;
+        return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/${info.gibsLayer}/default/${date}/GoogleMapsCompatible_Level${info.maxNativeZoom}/${z}/${y}/${x}.${info.ext}`;
+      }
+      const geoInfoForTile = geoWmsInfo(layerId);
+      if (geoInfoForTile) {
+        const info = geoInfoForTile;
         if (info.type === "wmts") {
           return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/${info.gibsLayer}/default/${date}/GoogleMapsCompatible_Level${info.maxNativeZoom}/${z}/${y}/${x}.png`;
         }
@@ -482,12 +697,16 @@ window.MetisImageryPlayback = (() => {
         const nwM = L.CRS.EPSG3857.project(nw);
         const seM = L.CRS.EPSG3857.project(se);
         const params = new URLSearchParams({
-          service: "WMS", request: "GetMap", layers: info.wmsLayer, styles: "",
-          format: "image/png", transparent: "true", version: "1.3.0",
-          width: String(TILE_SIZE), height: String(TILE_SIZE), crs: "EPSG:3857",
-          bbox: `${nwM.x},${seM.y},${seM.x},${nwM.y}`, time: date,
+          layers: info.wmsLayer, width: String(TILE_SIZE), height: String(TILE_SIZE),
+          crs: "EPSG:3857", bbox: `${nwM.x},${seM.y},${seM.x},${nwM.y}`, time: date,
         });
-        return `${info.wmsBase}?${params.toString()}`;
+        // Routed through the app's own worker (/api/tiles/eumetsat), not
+        // EUMETSAT directly like the live map's tiles (map-overlays.js) --
+        // EUMETSAT's GetMap never sends CORS headers (confirmed live,
+        // repeatedly), which this canvas-based capture pipeline needs and
+        // the live map doesn't. The worker adds the header and re-serves
+        // the same bytes; see its own comment for the full story.
+        return `/api/tiles/eumetsat?${params.toString()}`;
       }
       if (layerId === "s2cloudless") {
         return `https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-${date}_3857/default/GoogleMapsCompatible/${z}/${y}/${x}.jpg`;
@@ -502,6 +721,267 @@ window.MetisImageryPlayback = (() => {
       return `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${z}/${y}/${x}`;
     }
 
+    // GEOS_IRX is one whole-globe equirectangular image per hour, not a
+    // per-tile WMS/WMTS grid -- captureFrame's usual per-cell fetch/draw loop
+    // doesn't apply. This fetches the single source image for `date` (falling
+    // back to earlier hours if gap fill is on and the requested hour is still
+    // blank/compositing) and reprojects it across the *whole* captured rect
+    // in one pass: the same row-by-row remap map-overlays.js's
+    // EquirectangularTileLayer does per-tile for the live map (longitude is
+    // linear so one column scale/offset covers the whole width; only
+    // latitude needs per-row unprojection), just scaled up to cover
+    // everything captureFrame asked for instead of one 256x256 tile.
+    async function captureGeosmosaicFrame(date, { nw, se, z, width, height, withLabels, gapFill, signal }) {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+      const attempts = [date];
+      if (gapFill) {
+        for (const hoursBack of [1, 2, 3, 6]) attempts.push(shiftGeosmosaicHour(date, hoursBack));
+      }
+      let usedDate = null;
+      let filledFromEarlier = false;
+      for (let i = 0; i < attempts.length; i++) {
+        throwIfAborted(signal);
+        const attemptDate = attempts[i];
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const img = await loadTileCached(geosmosaicImageUrl(attemptDate), signal);
+          const srcW = img.naturalWidth;
+          const srcH = img.naturalHeight;
+          if (!srcW || !srcH) throw new Error("empty image");
+          const worldSize = TILE_SIZE * (2 ** z);
+          // Wrap the source column the same way the tile grid wraps tile X.
+          // A view panned across the antimeridian projects to a negative
+          // nw.x, and drawImage silently CLIPS a source rect starting left
+          // of the image -- blanking exactly that slice of the frame. This
+          // is a whole-globe equirectangular image, so the column wraps: the
+          // part left of the seam is drawn from the right end of the source.
+          const srcColWidth = Math.min(srcW, ((se.x - nw.x) / worldSize) * srcW);
+          const colStart = ((((nw.x / worldSize) * srcW) % srcW) + srcW) % srcW;
+          const headW = Math.min(srcColWidth, srcW - colStart);
+          const headDestW = width * (headW / srcColWidth);
+          for (let py = 0; py < height; py++) {
+            const worldY = nw.y + ((se.y - nw.y) * py) / height;
+            const latLng = map.unproject([nw.x, worldY], z);
+            const srcRow = Math.max(0, Math.min(srcH - 1, Math.round(((90 - latLng.lat) / 180) * srcH)));
+            ctx.drawImage(img, colStart, srcRow, headW, 1, 0, py, headDestW, 1);
+            if (srcColWidth > headW) {
+              ctx.drawImage(img, 0, srcRow, srcColWidth - headW, 1, headDestW, py, width - headDestW, 1);
+            }
+          }
+          const coverage = canvasDataCoverage(canvas);
+          if (coverage > TILE_EMPTY_COVERAGE || i === attempts.length - 1) {
+            usedDate = attemptDate;
+            filledFromEarlier = i > 0 && coverage > TILE_EMPTY_COVERAGE;
+            break;
+          }
+          // Still essentially blank -- the requested hour's composite is
+          // probably still assembling on NSMC's side. Clear and fall
+          // through to the next, older attempt rather than keep it.
+          ctx.clearRect(0, 0, width, height);
+        } catch (err) {
+          if (err?.message === "Cancelled") throw err;
+          // Network/decode failure -- fall through to the next attempt.
+        }
+      }
+
+      if (withLabels && usedDate) {
+        const maxTile = 2 ** z - 1;
+        const tileXStart = Math.floor(nw.x / TILE_SIZE);
+        const tileXEnd = Math.floor((se.x - 1) / TILE_SIZE);
+        const tileYStart = Math.max(0, Math.floor(nw.y / TILE_SIZE));
+        const tileYEnd = Math.min(maxTile, Math.floor((se.y - 1) / TILE_SIZE));
+        const labelTasks = [];
+        for (let tx = tileXStart; tx <= tileXEnd; tx++) {
+          for (let ty = tileYStart; ty <= tileYEnd; ty++) {
+            const sx = wrapTileX(tx, z);
+            const drawX = (tx * TILE_SIZE - nw.x);
+            const drawY = (ty * TILE_SIZE - nw.y);
+            labelTasks.push(async () => {
+              try {
+                const label = await loadTileCached(labelsTileUrl(z, sx, ty), signal);
+                ctx.drawImage(label, drawX, drawY, TILE_SIZE, TILE_SIZE);
+              } catch { /* labels are optional */ }
+            });
+          }
+        }
+        await runLimited(labelTasks, TILE_FETCH_CONCURRENCY, signal);
+      }
+
+      const dataCoverage = canvasDataCoverage(canvas);
+      const stats = sampleCanvasStats(canvas);
+      return {
+        canvas,
+        tileOk: usedDate ? 1 : 0,
+        tileFail: usedDate ? 0 : 1,
+        tileCoverage: usedDate ? 1 : 0,
+        pixelCoverage: dataCoverage,
+        gapFilledTiles: filledFromEarlier ? 1 : 0,
+        gapFillSources: filledFromEarlier ? [`resolved to ${usedDate}`] : [],
+        blank: !usedDate || stats.renderedError,
+      };
+    }
+
+    // Same "one big image instead of many small tiles" idea as
+    // captureGeosmosaicFrame above, for whichever single EUMETSAT
+    // satellite/product the playback dropdown currently has selected --
+    // only used when that satellite's family is toggled to "Single image"
+    // (see singleImageBboxFor above). Unlike geosmosaic's fixed whole-globe
+    // source, `bbox` here can be a regional geostationary disc, so the
+    // column mapping (longitude is still linear either way) uses that
+    // narrower span instead of a hardcoded 360.
+    async function captureSingleImageWmsFrame(wmsLayer, bbox, date, { nw, se, z, width, height, withLabels, signal }) {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      let usedOk = false;
+      try {
+        const img = await loadTileCached(singleImageWmsUrl(wmsLayer, bbox, date), signal);
+        const srcW = img.naturalWidth;
+        const srcH = img.naturalHeight;
+        if (!srcW || !srcH) throw new Error("empty image");
+        const lonSpan = bbox.east - bbox.west;
+        const latSpan = bbox.north - bbox.south;
+        const worldSize = TILE_SIZE * (2 ** z);
+        const lonLeft = -180 + (nw.x / worldSize) * 360;
+        const lonRight = -180 + (se.x / worldSize) * 360;
+        // A view panned across the antimeridian spans longitudes outside
+        // -180..180. Unlike a whole-globe image, a regional disc does not
+        // wrap -- it repeats once per visible world copy -- so collect every
+        // copy the capture actually overlaps. A normal in-range view yields
+        // exactly [0], i.e. the single pass this did before.
+        const srcColWidth = ((lonRight - lonLeft) / lonSpan) * srcW;
+        const shifts = [];
+        for (let k = -2; k <= 2; k++) {
+          if (lonRight + k * 360 > bbox.west && lonLeft + k * 360 < bbox.east) shifts.push(k);
+        }
+        if (shifts.length) {
+          for (let py = 0; py < height; py++) {
+            const worldY = nw.y + ((se.y - nw.y) * py) / height;
+            const latLng = map.unproject([nw.x, worldY], z);
+            if (latLng.lat < bbox.south || latLng.lat > bbox.north) continue;
+            const srcRow = Math.max(0, Math.min(srcH - 1, ((bbox.north - latLng.lat) / latSpan) * srcH));
+            for (const k of shifts) {
+              // drawImage clips a source rect that overhangs the image and
+              // scales the destination to match, so each copy lands in the
+              // right slice of the canvas without extra bookkeeping.
+              const srcColStart = ((lonLeft + k * 360 - bbox.west) / lonSpan) * srcW;
+              ctx.drawImage(img, srcColStart, srcRow, srcColWidth, 1, 0, py, width, 1);
+            }
+          }
+          usedOk = true;
+        }
+      } catch (err) {
+        if (err?.message === "Cancelled") throw err;
+        // Network/decode failure, or the capture rect fell entirely outside
+        // this disc's coverage -- leave the canvas blank, same as a failed
+        // tile batch would.
+      }
+
+      if (withLabels && usedOk) {
+        const maxTile = 2 ** z - 1;
+        const tileXStart = Math.floor(nw.x / TILE_SIZE);
+        const tileXEnd = Math.floor((se.x - 1) / TILE_SIZE);
+        const tileYStart = Math.max(0, Math.floor(nw.y / TILE_SIZE));
+        const tileYEnd = Math.min(maxTile, Math.floor((se.y - 1) / TILE_SIZE));
+        const labelTasks = [];
+        for (let tx = tileXStart; tx <= tileXEnd; tx++) {
+          for (let ty = tileYStart; ty <= tileYEnd; ty++) {
+            const sx = wrapTileX(tx, z);
+            const drawX = (tx * TILE_SIZE - nw.x);
+            const drawY = (ty * TILE_SIZE - nw.y);
+            labelTasks.push(async () => {
+              try {
+                const label = await loadTileCached(labelsTileUrl(z, sx, ty), signal);
+                ctx.drawImage(label, drawX, drawY, TILE_SIZE, TILE_SIZE);
+              } catch { /* labels are optional */ }
+            });
+          }
+        }
+        await runLimited(labelTasks, TILE_FETCH_CONCURRENCY, signal);
+      }
+
+      const dataCoverage = canvasDataCoverage(canvas);
+      const stats = sampleCanvasStats(canvas);
+      return {
+        canvas,
+        tileOk: usedOk ? 1 : 0,
+        tileFail: usedOk ? 0 : 1,
+        tileCoverage: usedOk ? 1 : 0,
+        pixelCoverage: dataCoverage,
+        gapFilledTiles: 0,
+        gapFillSources: [],
+        blank: !usedOk || stats.renderedError,
+      };
+    }
+
+    // One EPSG:3857 GetMap covering exactly the captured viewport. Because
+    // the request is in the same projection the canvas is in, the response
+    // maps 1:1 onto it -- no per-row reprojection like the equirectangular
+    // whole-globe path above needs. Returns null (not a blank frame) if the
+    // request fails, so the caller can fall back to the tile grid.
+    async function captureViewWmsFrame(wmsLayer, date, { nw, se, z, width, height, withLabels, signal }) {
+      const nwLL = map.unproject([nw.x, nw.y], z);
+      const seLL = map.unproject([se.x, se.y], z);
+      const nwM = L.CRS.EPSG3857.project(nwLL);
+      const seM = L.CRS.EPSG3857.project(seLL);
+      const params = new URLSearchParams({
+        layers: wmsLayer, width: String(width), height: String(height),
+        crs: "EPSG:3857", bbox: `${nwM.x},${seM.y},${seM.x},${nwM.y}`, time: date,
+      });
+      let img = null;
+      try {
+        img = await loadTileCached(`/api/tiles/eumetsat?${params.toString()}`, signal);
+      } catch (err) {
+        if (err?.message === "Cancelled") throw err;
+      }
+      if (img && (!img.naturalWidth || !img.naturalHeight)) img = null;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (img) ctx.drawImage(img, 0, 0, width, height);
+      if (img && withLabels) {
+        // Labels stay tiled -- they come from a different, fast provider and
+        // there is no GetMap equivalent for them.
+        const maxTile = 2 ** z - 1;
+        const tasks = [];
+        for (let tx = Math.floor(nw.x / TILE_SIZE); tx <= Math.floor((se.x - 1) / TILE_SIZE); tx++) {
+          for (let ty = Math.max(0, Math.floor(nw.y / TILE_SIZE)); ty <= Math.min(maxTile, Math.floor((se.y - 1) / TILE_SIZE)); ty++) {
+            const drawX = tx * TILE_SIZE - nw.x;
+            const drawY = ty * TILE_SIZE - nw.y;
+            const wrapped = wrapTileX(tx, z);
+            tasks.push(async () => {
+              try {
+                const label = await loadTileCached(labelsTileUrl(z, wrapped, ty), signal);
+                ctx.drawImage(label, drawX, drawY, TILE_SIZE, TILE_SIZE);
+              } catch { /* labels are optional */ }
+            });
+          }
+        }
+        await runLimited(tasks, TILE_FETCH_CONCURRENCY, signal);
+      }
+      // Same flat shape every other capture path returns -- callers read
+      // pixelCoverage/tileOk/blank off the top level, so nesting them under a
+      // `meta` key silently produced "NaN%" in the progress line.
+      const dataCoverage = canvasDataCoverage(canvas);
+      const stats = sampleCanvasStats(canvas);
+      return {
+        canvas,
+        tileOk: img ? 1 : 0,
+        tileFail: img ? 0 : 1,
+        tileCoverage: img ? 1 : 0,
+        pixelCoverage: dataCoverage,
+        gapFilledTiles: 0,
+        gapFillSources: [],
+        blank: !img || stats.renderedError,
+      };
+    }
+
     // Composites every tile touching the given pixel-space rect at zoom z.
     // Labels are drawn only after imagery tiles for that cell succeed, so a
     // failed imagery tile doesn't leave orphan place-name text over a hole.
@@ -513,6 +993,44 @@ window.MetisImageryPlayback = (() => {
       // past maxNativeZoom; expanding it to a whole tile changed the extent.
       const width = Math.max(1, Math.ceil((se.x - nw.x) * renderScale));
       const height = Math.max(1, Math.ceil((se.y - nw.y) * renderScale));
+      if (layerId === "geosmosaic") {
+        return captureGeosmosaicFrame(date, { nw, se, z, width, height, withLabels, gapFill, signal });
+      }
+      const singleImageBbox = singleImageBboxFor(layerId);
+      if (singleImageBbox) {
+        const info = geoWmsInfo(layerId);
+        return captureSingleImageWmsFrame(info.wmsLayer, singleImageBbox, date, { nw, se, z, width, height, withLabels, signal });
+      }
+      // One GetMap covering exactly the captured view, instead of a grid of
+      // 256px tiles of the same area. Same pixels, ~1/25th the requests.
+      //
+      // Measured against this proxy: 25 tiles at 6-way concurrency took 10.9s,
+      // the equivalent single 1280x1280 GetMap took 3.1s -- 3.5x, and 22
+      // frames drops from ~4 min to ~1.2 min. Raising tile concurrency does
+      // NOT help: the browser already reaches 24 in flight, but EUMETSAT
+      // saturates at ~2.9 responses/sec, so per-request latency just rises to
+      // match. Only cutting the request COUNT moves the wall clock.
+      //
+      // There is no resolution trade: a 1280x1280 GetMap over a 5x5 tile view
+      // is the same 1280x1280 pixels the tiles would have produced. The proxy
+      // caps a side at 1600 (server.py/_handle_eumetsat_tile), so anything
+      // larger falls through to the tile grid below rather than being scaled
+      // down.
+      const viewWmsInfo = geoWmsInfo(layerId);
+      if (viewWmsInfo?.type === "wms" && viewWmsInfo.wmsLayer
+          && width <= SINGLE_VIEW_MAX_PX && height <= SINGLE_VIEW_MAX_PX) {
+        // Deliberately NO fall-through to the tile grid when this fails.
+        // Measured: when EUMETSAT 502s a given time/area it does so for a
+        // 256x256 tile exactly as for a 1599x1599 GetMap, so retrying the
+        // same frame as 25 tiles just spends 25 more requests to fail again
+        // -- one such frame accounted for 75 of the 105 requests in a
+        // 15-frame load. loadTileCached already retries this request 3x with
+        // backoff; past that the frame is genuinely unavailable and the
+        // existing skipped/sparse-frame reporting says so.
+        return captureViewWmsFrame(viewWmsInfo.wmsLayer, date, {
+          nw, se, z, width, height, withLabels, signal,
+        });
+      }
       // A personal Sentinel Hub free-tier instance rate-limits far more
       // readily than the public tile providers below -- 6 tiles fired at
       // once from a single frame was enough to trip a 429 on it. Every
@@ -543,8 +1061,8 @@ window.MetisImageryPlayback = (() => {
       }
 
       const maxTile = 2 ** z - 1;
-      const tileXStart = Math.max(0, Math.floor(nw.x / TILE_SIZE));
-      const tileXEnd = Math.min(maxTile, Math.floor((se.x - 1) / TILE_SIZE));
+      const tileXStart = Math.floor(nw.x / TILE_SIZE);
+      const tileXEnd = Math.floor((se.x - 1) / TILE_SIZE);
       const tileYStart = Math.max(0, Math.floor(nw.y / TILE_SIZE));
       const tileYEnd = Math.min(maxTile, Math.floor((se.y - 1) / TILE_SIZE));
 
@@ -553,8 +1071,12 @@ window.MetisImageryPlayback = (() => {
       for (let tx = tileXStart; tx <= tileXEnd; tx++) {
         for (let ty = tileYStart; ty <= tileYEnd; ty++) {
           cells.push({
-            tx,
+            // Wrapped: what the provider is actually asked for. Every URL
+            // builder below reads cell.tx, so wrapping once here covers the
+            // primary fetch, the gap-fill sources and the label overlay.
+            tx: wrapTileX(tx, z),
             ty,
+            // Unwrapped: where the tile lands on the capture canvas.
             drawX: (tx * TILE_SIZE - nw.x) * renderScale,
             drawY: (ty * TILE_SIZE - nw.y) * renderScale,
             coverage: 0,
@@ -713,15 +1235,7 @@ window.MetisImageryPlayback = (() => {
         gapFilledTiles = cells.filter((c) => c.filled).length;
       }
 
-      // Measure real data coverage while no-data is still transparent/black,
-      // then lay the dark background underneath everything drawn so far.
       const dataCoverage = canvasDataCoverage(canvas);
-      ctx.save();
-      ctx.globalCompositeOperation = "destination-over";
-      ctx.fillStyle = BACKGROUND_FILL;
-      ctx.fillRect(0, 0, width, height);
-      ctx.restore();
-
       const total = tileOk + tileFail;
       const stats = sampleCanvasStats(canvas);
       return {
@@ -838,6 +1352,12 @@ window.MetisImageryPlayback = (() => {
 
     async function loadFrames({
       layerId, startDate, endDate, stepDays, hoursBack, intervalMinutes,
+      // Explicit instants (epoch ms) for the near-real-time satellites. When
+      // both are given and the provider publishes an extent, every real slot
+      // between them is requested and hoursBack/intervalMinutes are unused --
+      // see the enumeration block below. They stay as the fallback for
+      // providers with no published extent (e.g. the CMA IR mosaic).
+      rangeStartMs, rangeEndMs,
       releaseCount, yearsCount, withLabels, gapFill = false,
       onProgress,
     }) {
@@ -847,15 +1367,22 @@ window.MetisImageryPlayback = (() => {
       clearFrames({ keepController: true });
       tileCache.clear();
 
-      // "isGoes" now covers all five geostationary satellites (GOES-East/
-      // West, Himawari, Meteosat-0/IODC) -- all share the same hours-back +
-      // interval-minutes playback UI and slot-shifting gap fill, kept the
-      // shorter name since it's used throughout this function already.
-      const isGoes = !!window.MetisGeoSat?.SATELLITES[layerId];
+      // "isGoes" now covers every geostationary-style WMS/WMTS satellite --
+      // GOES-East/West, Himawari, Meteosat-0/IODC, MTG, and Metop-A/B/C
+      // (metop-picker.js, same EUMETSAT WMS mechanism, just a different
+      // picker module -- see geoWmsInfo above) -- all share the same
+      // hours-back + interval-minutes playback UI and slot-shifting gap
+      // fill, kept the shorter name since it's used throughout this
+      // function already. The mosaic is its own flag: same hours-back UI,
+      // but an hourly grid and a single whole-globe image per frame rather
+      // than a per-tile WMS/WMTS request (see captureGeosmosaicFrame).
+      const isGoes = !!geoWmsInfo(layerId);
+      const isGeosmosaic = layerId === "geosmosaic";
       const isWayback = layerId === "worldimagery";
       const isS2 = layerId === "s2cloudless";
       const isSH = layerId === "sentinelhub";
       const gibs = GIBS_PRODUCTS[layerId];
+      const dailySatInfo = window.MetisDailySat?.SATELLITES[layerId] ? window.MetisDailySat.layerInfo(layerId) : null;
       // Playback must request exactly what the normal layer would show for
       // the same selected day. Both paths therefore use the shared live
       // window; there is no playback-only widening or coverage preflight.
@@ -864,10 +1391,18 @@ window.MetisImageryPlayback = (() => {
       // Air Mass and Clean Infrared cap at 6, confirmed against GIBS' own
       // capabilities (see geo-satellite-picker.js). Read the real ceiling
       // for whichever product is currently selected instead of assuming 7.
-      const geoInfo = isGoes ? window.MetisGeoSat?.layerInfo(layerId) : null;
+      const geoInfo = isGoes ? geoWmsInfo(layerId) : null;
 
+      // Same story for VIIRS's product family -- True Colour caps at 9,
+      // but Cloud Top Height/Cirrus/DayNightBand cap at 7 (confirmed live
+      // against GIBS' own capabilities, see daily-satellite-picker.js).
+      // Falling through to the 19 default here (as it did before
+      // MetisDailySat carried a real product/zoom per option) would ask
+      // for tiles several zoom levels past what actually exists.
       const maxNativeZoom = gibs ? gibs.maxNativeZoom
+        : dailySatInfo ? dailySatInfo.maxNativeZoom
         : isGoes ? (geoInfo?.maxNativeZoom ?? 7)
+        : isGeosmosaic ? 12
         : isS2 ? 14
         : isSH ? 18
         : 19;
@@ -883,25 +1418,36 @@ window.MetisImageryPlayback = (() => {
         throw new Error("Add a Sentinel Hub instance ID first (toggle the layer on in the Satellite rail).");
       }
 
-      let bounds = map.getBounds();
+      let bounds = captureBounds();
       let nw = map.project(bounds.getNorthWest(), z);
       let se = map.project(bounds.getSouthEast(), z);
       if (!Number.isFinite(nw.x) || !Number.isFinite(se.x) || se.x - nw.x <= 0 || se.y - nw.y <= 0) {
         map.invalidateSize();
         await new Promise((resolve) => setTimeout(resolve, 80));
         throwIfAborted(signal);
-        bounds = map.getBounds();
+        bounds = captureBounds();
         nw = map.project(bounds.getNorthWest(), z);
         se = map.project(bounds.getSouthEast(), z);
         if (!Number.isFinite(nw.x) || !Number.isFinite(se.x) || se.x - nw.x <= 0 || se.y - nw.y <= 0) {
           throw new Error("Map view isn't ready yet -- pan/zoom the map and try again.");
         }
       }
+      // Record the geometry this sequence is captured at, and drop any
+      // basemap built for a previous view -- a new load may be at a different
+      // zoom/extent, and reusing the old underlay would misregister it.
+      captureGeometry = { nw, se, z, renderScale };
+      basemapCanvas = null;
       let releases = [];
       let waybackFrames = null;
       let dates;
       let targetCount = null;
       const skipped = [];
+      // Declared at this scope (not inside the branch below that actually
+      // sets it) because the dedup pass that reads it, much further down,
+      // runs for every layer family, not just the EUMETSAT one that sets
+      // it -- a block-scoped declaration there would throw a
+      // ReferenceError for Wayback/S2 loads, which never reach that branch.
+      let enumStepDivisor = 1;
 
       if (isWayback) {
         releases = await rasterOverlays.ensureReleasesLoaded();
@@ -925,18 +1471,92 @@ window.MetisImageryPlayback = (() => {
           if (y >= yearBounds.min) dates.push(String(y));
         }
       } else {
+        // Anchor the newest frame to imagery that actually exists, per
+        // provider, instead of to wall-clock. Every one of these feeds
+        // publishes behind real time, and by wildly different amounts, so a
+        // fixed "now minus a bit" guess is wrong for all of them:
+        //
+        //   GIBS/WMTS (GOES, Himawari): ~10-20 min behind -- probe backward
+        //   for the newest slot with real pixels (a pending slot answers 200
+        //   with a blank placeholder, so only pixels can tell).
+        //
+        //   EUMETSAT/WMS (Meteosat, MTG, Metop): can be HOURS behind --
+        //   measured Metop-B at 10:28Z against a 15:39Z wall clock, a 5h11m
+        //   lag, because it is a polar orbiter on a ~100-min orbit plus
+        //   processing time. Anchoring those to wall-clock put every single
+        //   requested slot in the future, so every frame came back empty and
+        //   the whole sequence was skipped as "no data" -- reported as Metop
+        //   not loading history at all. Their GetCapabilities advertises the
+        //   real newest scene per layer; refreshMtgTimeDefaults already
+        //   parses and caches exactly that (it is what the live map view
+        //   uses), so reuse it rather than guessing.
+        //
+        // The same GetCapabilities Dimension also declares each layer's real
+        // publish PERIOD, which is not 10 minutes for any of the EUMETSAT
+        // feeds (Metop PT1H40M, Meteosat PT15M, SST PT12H). Passing it to
+        // timeRange is what stops a short span collapsing every frame onto
+        // one scene -- see that function for the measurements.
+        let goesLatestSlotMs;
+        let goesPeriodMinutes;
+        if (isGoes && geoInfo?.type === "wmts" && geoInfo.gibsLayer) {
+          goesLatestSlotMs = await resolveLatestGoesSlot(geoInfo.gibsLayer, geoInfo.maxNativeZoom ?? 7, signal);
+        } else if (isGoes && geoInfo?.wmsLayer) {
+          const timeDefaults = await rasterOverlays.refreshMtgTimeDefaults();
+          const parsed = Date.parse(timeDefaults?.[geoInfo.wmsLayer] || "");
+          if (Number.isFinite(parsed)) goesLatestSlotMs = parsed;
+          goesPeriodMinutes = rasterOverlays.mtgTimePeriodFor?.(geoInfo.wmsLayer) || undefined;
+        }
+        // Preferred path for EUMETSAT layers: ask the provider's own
+        // GetCapabilities which timestamps it actually holds between the two
+        // instants the user picked, and request exactly those. Nothing is
+        // guessed, so nothing is missed and nothing lands between slots.
+        // Verified live: a 12-hour window enumerated 8 real Metop-B slots and
+        // 73 real MTG slots, and every single one returned real imagery --
+        // 0 errors, versus the cadence-guessing path below which produced 61
+        // frames for 10 hours of Metop where only ~6 real scenes exist.
+        //
+        // EVERY slot in the range is requested -- deliberately not thinned.
+        // An earlier version kept only one slot per "accumulation window"
+        // (6 orbits for Metop's rolling composites) on the theory that the
+        // intermediate ones were near-duplicates. Measured over the 20th to
+        // the 23rd: the range holds 52 real slots, that filter kept 9, and
+        // fetching all 52 returned 0 errors and 39 DISTINCT images with only
+        // 10 adjacent duplicate pairs. It was discarding 30 genuinely
+        // different images to avoid 10 repeats. Repeats are the provider's
+        // real content and the frame list already reports them; dropping
+        // real imagery to tidy them up is the wrong trade.
+        // Metop's declared period is nominal, not exact -- it's a polar
+        // orbiter, and its real orbit-to-orbit gap jitters by a few minutes
+        // rather than landing on a clean grid (measured live: 6 hand-checked
+        // real slots had gaps of 99/99/100/100 min, not a flat 100). Probing
+        // only at the nominal step demonstrably missed real slots sitting a
+        // few minutes off the guessed grid. Probing at half that step is a
+        // >>10x margin against the observed jitter. Confirmed this is
+        // Metop-specific: the same check against MTG (PT10M) and Meteosat
+        // (PT15M) found 8/8 images exactly on their declared grid, zero
+        // jitter -- a fixed geostationary scan schedule, unlike an orbit --
+        // so only the Metop family pays the extra request cost.
+        enumStepDivisor = (geoInfo?.family === "metop" || geoInfo?.family === "metopSst") ? 2 : 1;
+        let enumerated = null;
+        if (isGoes && geoInfo?.wmsLayer && rangeStartMs != null && rangeEndMs != null) {
+          enumerated = rasterOverlays.mtgTimeSlotsBetween?.(geoInfo.wmsLayer, rangeStartMs, rangeEndMs, enumStepDivisor) || null;
+        }
         dates = capDates(
-          isGoes ? timeRange(hoursBack, intervalMinutes) : dateRange(startDate, endDate, stepDays),
+          enumerated ? enumerated.map((ms) => `${new Date(ms).toISOString().slice(0, 16)}:00Z`)
+            : isGoes ? timeRange(hoursBack, intervalMinutes, goesLatestSlotMs, goesPeriodMinutes)
+            : isGeosmosaic ? geosmosaicTimeRange(hoursBack, intervalMinutes)
+            : dateRange(startDate, endDate, stepDays),
           MAX_FRAMES,
         );
       }
       if (!dates.length) {
-        throw new Error(isGoes ? "Invalid time range" : isWayback ? "No distinct releases found for this view" : isS2 ? "No years in range" : "Invalid date range");
+        throw new Error((isGoes || isGeosmosaic) ? "Invalid time range" : isWayback ? "No distinct releases found for this view" : isS2 ? "No years in range" : "Invalid date range");
       }
 
       const shLayerName = isSH ? (window.MetisApiKeys?.layerFor("sentinelhub") || "TRUE_COLOR") : "";
       const layerLabel = gibs ? gibs.label
         : isGoes ? `${geoInfo?.satLabel ?? "Geostationary"} (${geoInfo?.productLabel ?? "GeoColor"})`
+        : isGeosmosaic ? "CMA/NSMC global geostationary IR mosaic"
         : isS2 ? "EOX Sentinel-2 cloud-free"
         : isSH ? `Sentinel (${shLayerName})`
         : "Esri World Imagery (Wayback)";
@@ -1036,7 +1656,23 @@ window.MetisImageryPlayback = (() => {
       // Preserve every requested date. Wayback candidates were already
       // redirect-deduplicated before capture; other providers may legitimately
       // show the same pixels on adjacent dates and must not lose timeline slots.
+      //
+      // Metop is the one exception, and only when the finer probing grid
+      // above (enumStepDivisor > 1) is actually in play: that grid
+      // deliberately asks for MORE candidate times than there are real
+      // slots, specifically so a real slot sitting off the naive nominal
+      // grid still gets found -- which means two adjacent candidates can
+      // legitimately land on the exact same real scene via EUMETSAT's own
+      // nearestValue snapping. That's not "losing a timeline slot" the way
+      // the policy above guards against; it's the same real slot answering
+      // twice under two different guessed labels. Collapsing an adjacent
+      // pair whose actual pixels match (not just their date/label) is safe
+      // specifically because it's gated on the divisor -- every other
+      // path here (MTG, Meteosat, date-range, Wayback) never sets it above
+      // 1, so this loop is a no-op for them and the tested guarantee above
+      // still holds exactly as before.
       const seenKeys = new Set();
+      let prevKeptFingerprint = null;
       for (let i = 0; i < results.length; i++) {
         const r = results[i];
         if (!r) continue;
@@ -1044,7 +1680,12 @@ window.MetisImageryPlayback = (() => {
           skipped.push({ date: r.date, reason: "duplicate scene" });
           continue;
         }
+        if (enumStepDivisor > 1 && prevKeptFingerprint && framesLookIdentical(r.fingerprint, prevKeptFingerprint)) {
+          skipped.push({ date: r.date, reason: "same real scene as the previous frame (finer probing grid)" });
+          continue;
+        }
         seenKeys.add(r.key);
+        prevKeptFingerprint = r.fingerprint;
         const cacheKey = r.key;
         frameCache.set(cacheKey, {
           canvas: r.canvas,
@@ -1131,7 +1772,14 @@ window.MetisImageryPlayback = (() => {
       canvas.height = entry.canvas.height;
       positionOverlay();
       canvas.style.opacity = String(overlayOpacity);
-      canvas.getContext("2d").drawImage(entry.canvas, 0, 0);
+      const overlayCtx = canvas.getContext("2d");
+      // Frames carry transparent no-data now (see BACKGROUND_FILL), so the
+      // previous frame has to be cleared first -- without this, stepping
+      // between frames would leave the older frame showing through wherever
+      // the newer one has a gap. (Setting canvas.width above already clears
+      // it when the size changes; this covers the same-size case.)
+      overlayCtx.clearRect(0, 0, canvas.width, canvas.height);
+      overlayCtx.drawImage(entry.canvas, 0, 0);
       playIndex = currentDates.indexOf(date);
     }
 
@@ -1171,31 +1819,111 @@ window.MetisImageryPlayback = (() => {
       if (playTimer) { clearInterval(playTimer); playTimer = null; }
     }
 
+    // Clamps at the ends rather than wrapping. Reproduced live: with 15
+    // real Metop frames loaded, clicking Next 15 times from frame 1 reaches
+    // "Frame 15 / 15" correctly, but a 16th click silently wrapped back to
+    // "Frame 1 / 15" with no visual cue besides the small text label --
+    // someone stepping through by eye rather than reading the label counts
+    // that as a 16th distinct frame. Play/loop mode is unaffected: it uses
+    // its own advanceIndex() above, which still wraps/bounces per loopMode
+    // (that repeating is the point of a loop). This is only for the
+    // Prev/Next buttons and arrow keys, where a human is manually reviewing
+    // frames one at a time and "past the end" should mean stop, not repeat.
     function stepFrame(delta) {
       if (!currentDates.length) return 0;
-      playIndex = (playIndex + delta + currentDates.length) % currentDates.length;
+      playIndex = Math.max(0, Math.min(currentDates.length - 1, playIndex + delta));
       showFrame(playIndex);
       return playIndex;
     }
 
+    // Exports need the no-data gaps opaque, and the honest thing to put there
+    // is the same basemap the user is looking at -- a flat navy fill made
+    // every export of a partial-disc satellite (a Himawari or Meteosat frame
+    // covers well under half the screen) look broken, with coastline labels
+    // floating over an empty blue field. The basemap does not change between
+    // frames, so it is fetched ONCE per loaded sequence and composited under
+    // every frame, adding a single tile grid to an export rather than one per
+    // frame. Built lazily: a session that never exports never fetches it.
+    async function ensureBasemapCanvas(signal) {
+      if (basemapCanvas || !captureGeometry) return basemapCanvas;
+      const { nw, se, z, renderScale } = captureGeometry;
+      const width = Math.max(1, Math.ceil((se.x - nw.x) * renderScale));
+      const height = Math.max(1, Math.ceil((se.y - nw.y) * renderScale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.fillStyle = BACKGROUND_FILL;
+      ctx.fillRect(0, 0, width, height);
+
+      const maxTile = 2 ** z - 1;
+      const drawSize = TILE_SIZE * renderScale;
+      const tasks = [];
+      for (let tx = Math.floor(nw.x / TILE_SIZE); tx <= Math.floor((se.x - 1) / TILE_SIZE); tx++) {
+        for (let ty = Math.max(0, Math.floor(nw.y / TILE_SIZE)); ty <= Math.min(maxTile, Math.floor((se.y - 1) / TILE_SIZE)); ty++) {
+          const sx = wrapTileX(tx, z);
+          const drawX = (tx * TILE_SIZE - nw.x) * renderScale;
+          const drawY = (ty * TILE_SIZE - nw.y) * renderScale;
+          // Matches the on-screen basemap (see index.html's map init):
+          // CARTO's anonymous dark_all tiles started serving an "API KEY
+          // REQUIRED" watermark, so the live map moved to Esri's keyless
+          // Dark Gray Canvas -- split across a Base (fill/roads) service and
+          // a separate Reference (place-name labels) service on a second
+          // hostname. This export path was still pointed at the old,
+          // watermarked CARTO URL until now; draw base then labels, in that
+          // order, so labels land on top for this cell same as on screen.
+          const baseUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${z}/${ty}/${sx}`;
+          const refUrl = `https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${z}/${ty}/${sx}`;
+          tasks.push(async () => {
+            try {
+              const img = await loadTileCached(baseUrl, signal);
+              ctx.drawImage(img, drawX, drawY, drawSize, drawSize);
+            } catch { /* a missing base tile just leaves the dark fill */ }
+            try {
+              const labels = await loadTileCached(refUrl, signal);
+              ctx.drawImage(labels, drawX, drawY, drawSize, drawSize);
+            } catch { /* missing labels just leaves the unlabeled base */ }
+          });
+        }
+      }
+      await runLimited(tasks, TILE_FETCH_CONCURRENCY, signal);
+      basemapCanvas = canvas;
+      return basemapCanvas;
+    }
+
+    // Frames are stored with transparent no-data (see BACKGROUND_FILL's
+    // comment) so the live overlay shows the basemap through the gaps.
+    // Exports flatten a copy onto the basemap (or the dark fill, if the
+    // basemap could not be built) rather than mutating the cached frame.
+    function flattenForExport(source, targetWidth, targetHeight) {
+      const out = document.createElement("canvas");
+      out.width = targetWidth || source.width;
+      out.height = targetHeight || source.height;
+      const outCtx = out.getContext("2d", { willReadFrequently: true });
+      outCtx.fillStyle = BACKGROUND_FILL;
+      outCtx.fillRect(0, 0, out.width, out.height);
+      if (basemapCanvas) outCtx.drawImage(basemapCanvas, 0, 0, out.width, out.height);
+      outCtx.drawImage(source, 0, 0, out.width, out.height);
+      return out;
+    }
+
     async function exportGif({ delayMs = 400, maxDimension = 1280 } = {}) {
       if (!window.MetisGifEncoder) throw new Error("GIF encoder not loaded");
+      await ensureBasemapCanvas();
       const frames = [];
       for (const date of currentDates) {
         const entry = frameCache.get(date);
         if (!entry) continue;
-        let source = entry.canvas;
-        // Downscale very large captures so GIF encode stays responsive.
-        if (Math.max(source.width, source.height) > maxDimension) {
-          const scale = maxDimension / Math.max(source.width, source.height);
-          const w = Math.max(1, Math.round(source.width * scale));
-          const h = Math.max(1, Math.round(source.height * scale));
-          const scaled = document.createElement("canvas");
-          scaled.width = w;
-          scaled.height = h;
-          scaled.getContext("2d").drawImage(source, 0, 0, w, h);
-          source = scaled;
+        // Downscale very large captures so GIF encode stays responsive --
+        // flattenForExport doubles as the scaler since it redraws anyway.
+        let w = entry.canvas.width;
+        let h = entry.canvas.height;
+        if (Math.max(w, h) > maxDimension) {
+          const scale = maxDimension / Math.max(w, h);
+          w = Math.max(1, Math.round(w * scale));
+          h = Math.max(1, Math.round(h * scale));
         }
+        const source = flattenForExport(entry.canvas, w, h);
         const ctx = source.getContext("2d");
         frames.push({ imageData: ctx.getImageData(0, 0, source.width, source.height), delayMs });
       }
@@ -1207,16 +1935,37 @@ window.MetisImageryPlayback = (() => {
     // Full-resolution PNG of the frame currently on screen -- the GIF export
     // is palette-quantised and downscaled, which is the wrong format when the
     // point is to keep a single high-fidelity still.
-    function exportFramePng(index = playIndex) {
+    async function exportFramePng(index = playIndex) {
       const key = currentDates[Math.max(0, Math.min(currentDates.length - 1, index))];
       const entry = key != null ? frameCache.get(key) : null;
       if (!entry) throw new Error("No frame loaded");
+      await ensureBasemapCanvas();
       return new Promise((resolve, reject) => {
-        entry.canvas.toBlob((blob) => {
+        flattenForExport(entry.canvas).toBlob((blob) => {
           if (blob) resolve({ blob, date: entry.meta?.date || key });
           else reject(new Error("Could not encode PNG"));
         }, "image/png");
       });
+    }
+
+    // Every loaded frame at full capture resolution, as individual PNGs --
+    // for when the GIF's palette quantisation and downscaling (see
+    // exportGif above) throws away more than you want, and stepping
+    // through "Save frame PNG" one at a time isn't practical for a whole
+    // loaded sequence.
+    async function exportAllFramesPng() {
+      await ensureBasemapCanvas();
+      const results = [];
+      for (const date of currentDates) {
+        const entry = frameCache.get(date);
+        if (!entry) continue;
+        const blob = await new Promise((resolve, reject) => {
+          flattenForExport(entry.canvas).toBlob((b) => (b ? resolve(b) : reject(new Error("Could not encode PNG"))), "image/png");
+        });
+        results.push({ date: entry.meta?.date || date, blob });
+      }
+      if (!results.length) throw new Error("No frames loaded");
+      return results;
     }
 
     function frameInfo(index = playIndex) {
@@ -1225,10 +1974,52 @@ window.MetisImageryPlayback = (() => {
       return meta ? { ...meta } : null;
     }
 
+    // How many real frames a start/end range actually contains for this
+    // layer, WITHOUT fetching any imagery -- so the UI can say "this range
+    // holds N frames (~M tile requests)" and let the user confirm before a
+    // wide range on a 10-minute feed turns into thousands of requests.
+    // Returns null when the layer has no published extent to enumerate, so
+    // callers can tell "nothing in range" (0) from "can't know yet" (null).
+    // The layer's full published extent, for seeding a sensible default range
+    // without guessing how far back to look. Metop-A ended in 2021, MTG is
+    // minutes old -- any fixed "probe the last N days" window is wrong for
+    // one of them.
+    async function layerExtent(layerId) {
+      const info = geoWmsInfo(layerId);
+      if (!info?.wmsLayer) return null;
+      await rasterOverlays.refreshMtgTimeDefaults();
+      return rasterOverlays.mtgTimeExtentFor?.(info.wmsLayer) || null;
+    }
+
+    async function previewRange(layerId, rangeStartMs, rangeEndMs) {
+      const info = geoWmsInfo(layerId);
+      if (!info?.wmsLayer || rangeStartMs == null || rangeEndMs == null) return null;
+      await rasterOverlays.refreshMtgTimeDefaults();
+      // Same finer probing grid the actual fetch uses for Metop (see the
+      // enumStepDivisor comment at the fetch call site) -- otherwise this
+      // preview undercounts exactly the way the naive nominal-grid fetch
+      // used to. It's still an upper bound for Metop specifically: some of
+      // these candidates can resolve to the same real scene and get
+      // collapsed after fetching, so the eventual "Loaded N of M" can come
+      // in a little under this estimate -- never over it.
+      const stepDivisor = (info.family === "metop" || info.family === "metopSst") ? 2 : 1;
+      const slots = rasterOverlays.mtgTimeSlotsBetween?.(info.wmsLayer, rangeStartMs, rangeEndMs, stepDivisor);
+      if (!slots) return null;
+      const frames = Math.min(slots.length, MAX_FRAMES);
+      return {
+        frames,
+        cappedBy: slots.length > MAX_FRAMES ? MAX_FRAMES : null,
+        periodMinutes: rasterOverlays.mtgTimePeriodFor?.(info.wmsLayer) || null,
+        firstMs: slots.length ? slots[0] : null,
+        lastMs: slots.length ? slots[slots.length - 1] : null,
+      };
+    }
+
     return {
-      dateRange, timeRange, isoDay, loadFrames, clearFrames, cancelLoad,
+      dateRange, timeRange, geosmosaicTimeRange, isoDay, loadFrames, clearFrames, cancelLoad,
+      previewRange, layerExtent,
       showFrame, play, stopPlayback, stepFrame, setLoopMode, setOverlayOpacity,
-      exportGif, exportFramePng, frameInfo,
+      exportGif, exportFramePng, exportAllFramesPng, frameInfo,
       currentIndex: () => playIndex,
       isPlaying: () => playTimer != null,
       frameCount: () => currentDates.length,

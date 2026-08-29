@@ -15,6 +15,12 @@ window.MetisApiKeys = (() => {
       hint: "Paste the API key shown in your AirNow account.",
       url: "https://docs.airnowapi.org/account/request/",
     },
+    nasaDonki: {
+      label: "NASA DONKI",
+      storage: "metis-api-key-nasadonki",
+      hint: "Optional — DEMO_KEY is capped at 10 requests/hour per IP (with a multi-hour lockout once hit), so solar flare/CME events need a free personal key to stay reliable. Instant signup, no card.",
+      url: "https://api.nasa.gov/",
+    },
     currents: {
       label: "Currents API",
       storage: "metis-api-key-currents",
@@ -33,7 +39,7 @@ window.MetisApiKeys = (() => {
       // to render, same as requesting a layer name that doesn't exist.
       layerStorage: "metis-sentinelhub-layer",
       ccStorage: "metis-sentinelhub-maxcc",
-      ccDefault: 30,
+      ccDefault: 40,
       // Sentinel Hub's mosaicking PRIORITY picks which scene wins among
       // candidates already inside the cloud-coverage cap above -- maxcc is a
       // hard filter in both modes (a scene cloudier than the cap is excluded
@@ -89,7 +95,12 @@ window.MetisApiKeys = (() => {
     // explicit request since this app isn't publicly deployed, but if this
     // ever is shared or deployed somewhere else, every visitor would be
     // spending that same quota.
-    sentinelhub: "9dd46043-3e7f-427d-898d-3d88e9fdbd7c",
+    sentinelhub: "3cc19672-63c1-4e45-9e72-e8d46dbc726e",
+    // Personal api.nasa.gov key (2,500 requests/hour, vs DEMO_KEY's 10/hour
+    // with a ~19h lockout once hit). Same caveat as the Sentinel Hub entry:
+    // this is embedded client-side on request, so anyone loading the app can
+    // read it and spend the quota -- rotate at api.nasa.gov if that matters.
+    nasaDonki: "LuTzvH43GxmAiUb12vfgqQP23hDuuIoVGqOyOe7q",
   };
   let pending = null;
 
@@ -243,9 +254,8 @@ window.MetisApiKeys = (() => {
     const style = document.createElement("style");
     style.id = "metis-api-key-styles";
     style.textContent = `
-      .api-key-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px;
-        padding:7px 8px;border:1px solid var(--line,#304b52);background:rgba(6,23,30,.55)}
-      .api-key-tools span{color:var(--muted,#77949a);font-size:.59rem;letter-spacing:.05em}
+      .api-key-tools{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0 16px;
+        padding:0}
       .api-key-tools button{width:auto!important;margin:0!important;padding:5px 7px!important;border:1px solid var(--line,#304b52)!important;
         border-radius:0!important;background:#102d35!important;color:var(--text,#d8d1bc)!important;font:600 9px "IBM Plex Mono",monospace!important}
       .metis-key-backdrop{position:fixed;z-index:5000;inset:0;display:none;padding:18px;
@@ -253,9 +263,12 @@ window.MetisApiKeys = (() => {
       .metis-key-backdrop.show{display:block}
       .metis-key-dialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(460px,calc(100% - 36px));
         min-width:320px;min-height:260px;max-width:calc(100% - 24px);max-height:calc(100% - 24px);resize:both;overflow:auto;
-        border:1px solid #587078;background:#06171e;color:#d8d1bc;
-        box-shadow:8px 8px 0 rgba(0,0,0,.45);font:11px/1.5 "IBM Plex Mono",Consolas,monospace}
-      .metis-key-head{padding:11px 13px;border-bottom:1px solid #304b52;background:#081d25;cursor:grab;user-select:none;touch-action:none}
+        border:1px solid var(--glass-line,#304b52);border-radius:8px;background-clip:padding-box;
+        background:linear-gradient(135deg,var(--glass-panel-a,rgba(16,39,45,.9)),var(--glass-panel-b,rgba(7,25,31,.85)));
+        backdrop-filter:var(--glass-blur,blur(18px));-webkit-backdrop-filter:var(--glass-blur,blur(18px));color:#d8d1bc;
+        box-shadow:var(--glass-inner,inset 0 1px 0 rgba(255,255,255,.05)),var(--glass-drop,0 8px 24px rgba(0,8,12,.22)),0 20px 60px rgba(0,0,0,.45);
+        font:11px/1.5 "IBM Plex Mono",Consolas,monospace}
+      .metis-key-head{padding:11px 13px;border-bottom:1px solid var(--glass-line,#304b52);background:transparent;cursor:grab;user-select:none;touch-action:none}
       .metis-key-head.dragging{cursor:grabbing}
       .metis-key-kicker{color:#68cf91;font-size:9px;letter-spacing:.12em}
       .metis-key-title{margin-top:2px;color:#d9c69e;font:600 20px "Barlow Condensed","Arial Narrow",sans-serif;letter-spacing:.04em}
@@ -380,7 +393,7 @@ window.MetisApiKeys = (() => {
       root.querySelector("#metis-key-input").focus();
     });
     // maxcc still excludes anything cloudier than the cap in "most recent"
-    // mode too (see extras() in sentinel-hub.js) -- the default 30% cap
+    // mode too (see extras() in sentinel-hub.js) -- the default 40% cap
     // would keep it from finding much of anything actually recent, so
     // switching to "most recent" nudges the cap up to give it a real chance
     // of surfacing a newer, cloudier scene instead of quietly falling back
@@ -552,13 +565,29 @@ window.MetisApiKeys = (() => {
     if (!host || host.querySelector(".api-key-tools")) return;
     const available = feeds.filter((feed) => FEEDS[feed]);
     if (!available.length) return;
+    // ensureStyles() was previously only called from dialog() -- on a page
+    // load where no one has opened the key dialog yet, that left this bar's
+    // own margin/padding/button rules uninjected, so it rendered with none
+    // of its intended spacing (confirmed live: 0 margin, crammed against
+    // whatever sits right below it). mount() runs long before any dialog
+    // does, so it needs its own call too.
+    ensureStyles();
     const bar = document.createElement("div");
     bar.className = "api-key-tools";
-    bar.innerHTML = `<span>${available.length === 1 ? "OPTIONAL API KEY" : "OPTIONAL API KEYS"}</span>${available.map((feed) => `<button type="button" data-feed="${feed}">${FEEDS[feed].label.replace("NASA ", "").replace("EPA ", "")}${usingDefault(feed) ? " ✓" : ""}</button>`).join("")}`;
+    // Each button's own text ("Sentinel Key", "FIRMS Key") carries the
+    // "this manages an API key" context by itself now -- no separate
+    // "OPTIONAL API KEY(S)" label needed alongside it.
+    bar.innerHTML = available.map((feed) => `<button type="button" data-feed="${feed}">${FEEDS[feed].label.replace("NASA ", "").replace("EPA ", "")} Key${usingDefault(feed) ? " ✓" : ""}</button>`).join("");
     bar.querySelectorAll("button[data-feed]").forEach((button) => {
       button.addEventListener("click", () => prompt(button.dataset.feed, { manage: true }));
     });
-    host.prepend(bar);
+    // Sits right under the category's own heading (renderLayerGrid()'s
+    // "Satellite"/etc title+description) when there is one, instead of
+    // jumping the queue above it. Hosts with no such heading (e.g. the news
+    // panel via news-feed.js) keep the previous prepend-to-top placement.
+    const head = host.querySelector(".category-content-head");
+    if (head) head.insertAdjacentElement("afterend", bar);
+    else host.prepend(bar);
   }
 
   return { ensure, keyFor, mount, prompt, usingDefault, layerFor, ccFor, priorityFor, resampleFor };

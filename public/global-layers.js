@@ -307,6 +307,15 @@ window.GlobalLayers = (() => {
     });
     const rows = [...(data?.features || [])].sort((a, b) => (a.attributes?.OBJECTID ?? 0) - (b.attributes?.OBJECTID ?? 0));
     const clean = (v) => (Number.isFinite(v) && v !== 9999) ? v : null;
+    // NHC (EP/CP/AL) rows use 9999 for "not reported," which clean() already
+    // strips. JTWC (WP/IO/SH) rows instead leave MSLP/TCDIR/TCSPD at a plain
+    // 0 -- confirmed live: every WP storm in the feed had all three at
+    // exactly 0 together while EP/CP storms in the same query had real
+    // values for all three, and 0 mb is never a physically real pressure.
+    // Pressure alone is enough to catch this for MSLP; for movement, a
+    // direction paired with 0 kt speed is meaningless either way (a
+    // "stalled" storm has no defined heading), so gate both on speed.
+    const cleanPressure = (v) => (Number.isFinite(v) && v !== 9999 && v > 0) ? v : null;
     const items = new Map();
     const seenStorms = new Set();
     for (const f of rows) {
@@ -317,12 +326,14 @@ window.GlobalLayers = (() => {
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       seenStorms.add(stormKey);
       const id = `cyclone-${stormKey}`;
+      const speed = clean(Number(a.TCSPD));
+      const hasMovement = speed != null && speed > 0;
       items.set(id, {
         kind: "cyclone", id,
         name: String(a.STORMNAME || "").trim() || stormKey,
         classification: String(a.ITCDVLP || a.TCDVLP || "").trim(),
-        intensity: clean(Number(a.MAXWIND)), pressure: clean(Number(a.MSLP)),
-        lat, lon, movementDir: clean(Number(a.TCDIR)), movementSpeed: clean(Number(a.TCSPD)),
+        intensity: clean(Number(a.MAXWIND)), pressure: cleanPressure(Number(a.MSLP)),
+        lat, lon, movementDir: hasMovement ? clean(Number(a.TCDIR)) : null, movementSpeed: hasMovement ? speed : null,
         lastUpdate: a.FLDATELBL || (Number.isFinite(a.ADVDATE) ? new Date(a.ADVDATE).toISOString() : ""),
         basin: a.BASIN || "", raw: a,
       });
@@ -330,27 +341,46 @@ window.GlobalLayers = (() => {
     return items;
   }
 
+  // NCEI documents these as numeric codes on the HazEL event record.
+  const TSUNAMI_CAUSE = {
+    0: "Unknown", 1: "Earthquake", 2: "Questionable earthquake",
+    3: "Earthquake and landslide", 4: "Volcano and earthquake",
+    5: "Volcano, earthquake and landslide", 6: "Volcano", 7: "Volcano and landslide",
+    8: "Landslide", 9: "Meteorological", 10: "Explosion", 11: "Astronomical tide",
+  };
+  const TSUNAMI_VALIDITY = {
+    "-1": "Erroneous entry", 0: "Event that only caused a seiche", 1: "Very doubtful tsunami",
+    2: "Questionable tsunami", 3: "Probable tsunami", 4: "Definite tsunami",
+  };
+
   async function fetchTsunami(api) {
     const items = new Map();
+    const failures = [];
+    // Historical events come from NCEI's HazEL hazard-service. The older
+    // gis.ngdc.noaa.gov ArcGIS "web_mercator/hazards" MapServer this used to
+    // query stopped responding entirely -- it TLS-connects and then never
+    // returns a byte (verified: HTTP 000 after a 60s timeout, same failure
+    // shape GDACS's EVENTS4APP had). Because both branches below used to
+    // swallow their errors, the layer just rendered empty and silent.
     const [hist, alerts] = await Promise.all([
-      api("ncei", "/arcgis/rest/services/web_mercator/hazards/MapServer/0/query", {
-        where: "YEAR>=2000", outFields: "ID,YEAR,MONTH,DAY,LOCATION_NAME,TS_INTENSITY,CAUSE,EVENT_VALIDITY",
-        returnGeometry: true, resultRecordCount: 500, f: "geojson",
-      }).catch(() => ({ features: [] })),
+      api("ncei", "/hazel/hazard-service/api/v1/tsunamis/events", { minYear: 2000 })
+        .catch((err) => { failures.push(`historical events (${err.message})`); return { items: [] }; }),
       api("nws", "/alerts/active", { event: "Tsunami Warning,Tsunami Advisory,Tsunami Watch" })
-        .catch(() => ({ features: [] })),
+        .catch((err) => { failures.push(`active alerts (${err.message})`); return { features: [] }; }),
     ]);
-    for (const f of hist?.features || []) {
-      const p = f.properties || {};
-      const [lon, lat] = f.geometry?.coordinates || [];
+    for (const p of hist?.items || []) {
+      const lat = p.latitude;
+      const lon = p.longitude;
+      // A fair number of catalogue entries carry no coordinates at all.
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      const id = `tsunami-${p.ID || p.YEAR}-${lat}`;
-      items.set(id, {
-        kind: "tsunami", id,
-        name: p.LOCATION_NAME || `Tsunami ${p.YEAR}`,
-        lat, lon, year: p.YEAR, month: p.MONTH, day: p.DAY,
-        intensity: p.TS_INTENSITY, cause: p.CAUSE, validity: p.EVENT_VALIDITY,
-        source: "NCEI", time: p.YEAR ? new Date(p.YEAR, (p.MONTH || 1) - 1, p.DAY || 1).getTime() : null,
+      items.set(`tsunami-${p.id}`, {
+        kind: "tsunami", id: `tsunami-${p.id}`,
+        name: p.locationName || p.country || `Tsunami ${p.year}`,
+        lat, lon, year: p.year, month: p.month, day: p.day,
+        intensity: p.maxWaterHeight, cause: TSUNAMI_CAUSE[p.causeCode] ?? null,
+        validity: TSUNAMI_VALIDITY[p.eventValidity] ?? null,
+        magnitude: p.eqMagnitude, deaths: p.deathsTotal, country: p.country,
+        source: "NCEI", time: p.year ? new Date(p.year, (p.month || 1) - 1, p.day || 1).getTime() : null,
         raw: p,
       });
     }
@@ -370,6 +400,12 @@ window.GlobalLayers = (() => {
         time: p.sent ? new Date(p.sent).getTime() : Date.now(),
         raw: p,
       });
+    }
+    // Only surface a failure when it actually cost the user data. A dead
+    // source that returns nothing must not look identical to "no tsunamis
+    // right now" -- that silence is what made this read as simply broken.
+    if (!items.size && failures.length) {
+      throw new Error(`Tsunami sources unavailable: ${failures.join("; ")}`);
     }
     return items;
   }
@@ -669,10 +705,31 @@ window.GlobalLayers = (() => {
     return items;
   }
 
+  // NOAA's G (geomagnetic storm), S (solar radiation) and R (radio blackout)
+  // scales, 0-5. The API gives the number and its own short text; these are
+  // the official severity words, kept so a "1" reads as "Minor" without a
+  // lookup elsewhere.
+  const NOAA_SCALE_WORDS = ["None", "Minor", "Moderate", "Strong", "Severe", "Extreme"];
+  function readScale(entry) {
+    if (!entry) return null;
+    const level = Number(entry.Scale);
+    if (!Number.isFinite(level)) return null;
+    return { level, text: entry.Text || NOAA_SCALE_WORDS[level] || null };
+  }
+
   async function fetchSpaceWeather(api) {
-    const [kp1m, kp3h] = await Promise.all([
+    // The RTSW solar-wind archives (rtsw_mag_1m.json / rtsw_wind_1m.json) carry
+    // ~24h of 1-minute samples and run 1.6MB and 2.9MB -- far too heavy for a
+    // 60s poll. SWPC's /products/summary/* endpoints expose the same current
+    // values in ~60 BYTES each, which is what these use instead.
+    const [kp1m, kp3h, scales, magField, windSpeed, flare, kpForecast] = await Promise.all([
       api("swpc", "/json/planetary_k_index_1m.json", {}).catch(() => []),
       api("swpc", "/products/noaa-planetary-k-index.json", {}).catch(() => []),
+      api("swpc", "/products/noaa-scales.json", {}).catch(() => null),
+      api("swpc", "/products/summary/solar-wind-mag-field.json", {}).catch(() => []),
+      api("swpc", "/products/summary/solar-wind-speed.json", {}).catch(() => []),
+      api("swpc", "/json/goes/primary/xray-flares-latest.json", {}).catch(() => []),
+      api("swpc", "/products/noaa-planetary-k-index-forecast.json", {}).catch(() => []),
     ]);
     const r1 = Array.isArray(kp1m) && kp1m.length ? kp1m[kp1m.length - 1] : null;
     const r3 = Array.isArray(kp3h) && kp3h.length ? kp3h[kp3h.length - 1] : null;
@@ -683,6 +740,22 @@ window.GlobalLayers = (() => {
     const kp1mSeries = (Array.isArray(kp1m) ? kp1m : []).slice(-120)
       .map((r) => ({ t: new Date(r.time_tag).getTime(), v: r.kp_index ?? r.estimated_kp }))
       .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v));
+    // noaa-scales.json is keyed "0"=current, "1"=24h forecast, "2"=48h, plus a
+    // "-1" block of past-24h observed maxima.
+    const nowScales = scales && typeof scales === "object" ? scales["0"] : null;
+    const scale24h = scales && typeof scales === "object" ? scales["1"] : null;
+
+    const mag = Array.isArray(magField) && magField.length ? magField[magField.length - 1] : null;
+    const wind = Array.isArray(windSpeed) && windSpeed.length ? windSpeed[windSpeed.length - 1] : null;
+    const fl = Array.isArray(flare) && flare.length ? flare[flare.length - 1] : null;
+
+    // Forecast rows carry observed/estimated/predicted in the same array; only
+    // the genuinely future ones are a forecast.
+    const kpForecastSeries = (Array.isArray(kpForecast) ? kpForecast : [])
+      .filter((r) => r && r.observed === "predicted")
+      .map((r) => ({ t: new Date(r.time_tag).getTime(), v: Number(r.kp), scale: r.noaa_scale }))
+      .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v));
+
     return {
       kIndex,
       kpBand: r1?.kp ?? null,
@@ -692,7 +765,80 @@ window.GlobalLayers = (() => {
       source: r1 ? "1-minute" : "3-hour",
       kpSeries: kp3hSeries,
       kp1mSeries,
+      // NOAA severity scales, current and 24h outlook.
+      scaleG: readScale(nowScales?.G),
+      scaleS: readScale(nowScales?.S),
+      scaleR: readScale(nowScales?.R),
+      scaleGForecast: readScale(scale24h?.G),
+      scalesTime: nowScales?.DateStamp && nowScales?.TimeStamp
+        ? `${nowScales.DateStamp} ${nowScales.TimeStamp}` : null,
+      // Interplanetary magnetic field. bz southward (negative) is the single
+      // best predictor of aurora activity -- it is what lets solar wind energy
+      // couple into the magnetosphere.
+      bz: Number.isFinite(mag?.bz_gsm) ? mag.bz_gsm : null,
+      bt: Number.isFinite(mag?.bt) ? mag.bt : null,
+      solarWindSpeed: Number.isFinite(wind?.proton_speed) ? wind.proton_speed : null,
+      solarWindTime: mag?.time_tag ?? wind?.time_tag ?? null,
+      // Current GOES X-ray flare class (A/B/C/M/X); M and X disrupt HF radio.
+      flareClass: fl?.current_class ?? fl?.max_class ?? null,
+      flareBegan: fl?.begin_time ?? null,
+      kpForecastSeries,
     };
+  }
+
+  // NASA DONKI solar flare + CME catalogues. Deliberately on-demand (the
+  // Space panel loads it when asked) rather than part of fetchSpaceWeather's
+  // poll: these are human-curated event records that update in bursts around
+  // activity, not a continuous stream, and DEMO_KEY is rate-limited.
+  async function fetchSolarEvents(api, { days = 30 } = {}) {
+    const end = new Date();
+    const start = new Date(end.getTime() - days * 86400000);
+    const iso = (d) => d.toISOString().slice(0, 10);
+    // DEMO_KEY is capped at 10 req/hour per IP and answers with a ~19h
+    // Retry-After once exhausted (verified live), so a personal key -- free,
+    // instant, 1000/hour -- is what makes this usable. Falls back to
+    // DEMO_KEY so it still works out of the box for a first look.
+    const key = window.MetisApiKeys?.keyFor?.("nasaDonki") || "DEMO_KEY";
+    const params = { startDate: iso(start), endDate: iso(end), api_key: key };
+    // Track failures instead of swallowing them: a rate-limited DONKI
+    // returning [] is NOT the same as a genuinely quiet Sun, and conflating
+    // them is what makes a broken feed read as "nothing happening".
+    const failures = [];
+    const [flares, cmes] = await Promise.all([
+      api("nasaDonki", "/DONKI/FLR", params).catch((err) => { failures.push(err.message); return []; }),
+      api("nasaDonki", "/DONKI/CME", params).catch((err) => { failures.push(err.message); return []; }),
+    ]);
+    if (failures.length === 2) throw new Error(failures[0]);
+    const flareList = (Array.isArray(flares) ? flares : []).map((f) => ({
+      kind: "flare",
+      id: f.flrID,
+      classType: f.classType || null,
+      begin: f.beginTime || null,
+      peak: f.peakTime || null,
+      end: f.endTime || null,
+      sourceLocation: f.sourceLocation || null,
+      activeRegion: f.activeRegionNum || null,
+      link: f.link || null,
+      t: f.peakTime ? Date.parse(f.peakTime) : (f.beginTime ? Date.parse(f.beginTime) : 0),
+    }));
+    const cmeList = (Array.isArray(cmes) ? cmes : []).map((c) => {
+      // Several analyses per CME; the one NASA flags "most accurate" is the
+      // one worth showing, else fall back to the last submitted.
+      const analyses = Array.isArray(c.cmeAnalyses) ? c.cmeAnalyses : [];
+      const best = analyses.find((a) => a.isMostAccurate) || analyses[analyses.length - 1] || null;
+      return {
+        kind: "cme",
+        id: c.activityID,
+        begin: c.startTime || null,
+        speed: best?.speed ?? null,
+        halfAngle: best?.halfAngle ?? null,
+        type: best?.type ?? null,
+        note: c.note || null,
+        link: c.link || null,
+        t: c.startTime ? Date.parse(c.startTime) : 0,
+      };
+    });
+    return [...flareList, ...cmeList].sort((a, b) => b.t - a.t);
   }
 
   function parseCadDate(s) {
@@ -843,7 +989,7 @@ window.GlobalLayers = (() => {
     fetchEarthquakes, fetchRegionalQuakes, fetchVolcanoes, fetchCyclones, fetchTsunami, fetchVolcanicAsh,
     fetchFireballs, fetchBuoys, fetchMetar, fetchAirQuality, fetchNasaEvents, fetchGdacs,
     fetchCoopsStations, fetchCoopsHistory, fetchAircraft,
-    fetchSpaceWeather, fetchAurora, fetchEarthImagery,
+    fetchSpaceWeather, fetchSolarEvents, fetchAurora, fetchEarthImagery,
     fetchNeoApproach, fetchSentry, fetchScout,
   };
 })();

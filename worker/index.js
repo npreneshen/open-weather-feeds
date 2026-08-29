@@ -18,7 +18,10 @@ const SOURCES = Object.freeze({
   // making the browser wait ~20s+ for Cloudflare's own timeout to fire.
   opensky: { base: "https://opensky-network.org", ttl: 15, name: "OpenSky Network", timeoutMs: 8000 },
   swpc: { base: "https://services.swpc.noaa.gov", ttl: 60, name: "NOAA SWPC" },
-  ncei: { base: "https://gis.ngdc.noaa.gov", ttl: 3600, name: "NOAA NCEI GIS" },
+  // HazEL hazard-service, not the old gis.ngdc.noaa.gov ArcGIS host: that
+  // one now TLS-connects and then never sends a response (HTTP 000 after
+  // 60s), which stalled the tsunami layer until the client timeout.
+  ncei: { base: "https://www.ngdc.noaa.gov", ttl: 3600, name: "NOAA NCEI HazEL" },
   // api.weather.gov sits behind Akamai, whose bot manager flat-out 403s our
   // usual "AppName/version (+url)" identifying UA for this specific host
   // (verified live: identical request with a plain browser-style UA gets
@@ -50,6 +53,36 @@ const SOURCES = Object.freeze({
   },
   metno: { base: "https://api.met.no", ttl: 300, name: "MET Norway" },
   nasaPower: { base: "https://power.larc.nasa.gov", ttl: 3600, name: "NASA POWER" },
+  // DONKI = Space Weather Database Of Notifications, Knowledge, Information.
+  // Proxied rather than called direct (it is CORS-open) so the worker's cache
+  // absorbs repeat views: DEMO_KEY is rate-limited to ~30 requests/hour/IP,
+  // which a few panel opens would otherwise exhaust. 30min TTL -- flare and
+  // CME catalogues are curated, not streamed.
+  // Needs a browser-style UA for the same reason nws does: verified live that
+  // api.nasa.gov returns 403 {"error":{"message":"Forbidden"}} to our normal
+  // "MetisWeatherFeeds/3.4 (+url)" UA and 200 to a browser one.
+  // Two-line element sets. The service NASA's own API portal points at for
+  // TLE data; keyless, and elements only change ~daily.
+  // Third host after nws and api.nasa.gov that rejects our domain-styled UA
+  // -- this one drops the connection outright (RemoteDisconnected) rather
+  // than answering 403. Browser-style UA verified working.
+  tle: {
+    base: "https://tle.ivanstanojevic.me", ttl: 3600, name: "TLE API",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  },
+  nasaDonki: {
+    base: "https://api.nasa.gov", ttl: 1800, name: "NASA DONKI",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  },
+  // Mirrors the full SOHO/GOES mission archive (keyless, years of history)
+  // for the image modal's "Past 3/7 days" option -- only the tiny
+  // getClosestImage/ JSON lookups go through here; the resolved images
+  // themselves load straight from api.helioviewer.org in an <img>, same as
+  // every other imagery source in this app (CORS doesn't gate <img> display,
+  // only fetch()). No CORS header on the JSON endpoint, so that part does
+  // need the proxy. Verified live: accepts our normal UA fine (200), unlike
+  // nws/api.nasa.gov/tle above.
+  helioviewer: { base: "https://api.helioviewer.org", ttl: 600, name: "Helioviewer" },
   coops: { base: "https://api.tidesandcurrents.noaa.gov", ttl: 60, name: "NOAA CO-OPS" },
   gdacs: { base: "https://www.gdacs.org", ttl: 300, name: "GDACS" },
   geomet: { base: "https://api.weather.gc.ca", ttl: 300, name: "ECCC GeoMet" },
@@ -71,6 +104,14 @@ const SOURCES = Object.freeze({
   // proxied here same as everything else. Actual Wayback *tiles* are plain
   // <img> loads (no CORS needed) so those still go direct, unproxied.
   waybackConfig: { base: "https://s3-us-west-2.amazonaws.com", ttl: 86400, name: "Esri World Imagery Wayback" },
+  // RAMMB/CIRA SLIDER's metadata (which timestamps actually exist for a
+  // given satellite/sector/product) sends no CORS headers, so only that
+  // JSON needs proxying -- confirmed live -- the imagery tiles themselves
+  // are plain <img> loads like Wayback's, no proxy needed. Short TTL: this
+  // is specifically the "what's the latest timestamp" lookup, refreshed
+  // every few minutes at these cadences (EXPERIMENTAL -- scoped to this
+  // folder only, see index.html's RAMMB_HIMAWARI catalog).
+  rammbSlider: { base: "https://slider.cira.colostate.edu", ttl: 60, name: "RAMMB/CIRA SLIDER" },
 });
 
 // OpenSky's /api/states/all is a plain passthrough (no per-service bbox
@@ -101,6 +142,38 @@ function json(payload, status = 200, headers = {}) {
 
 function error(message, status = 400) {
   return json({ error: { message } }, status, { "Cache-Control": "no-store" });
+}
+
+// Same streaming size cap as readCappedText below, but returns raw bytes --
+// used for image tiles, where decoding through TextDecoder would corrupt
+// the binary PNG data.
+async function readCappedBytes(response, maxBytes) {
+  const declared = Number(response.headers.get("Content-Length") || 0);
+  if (declared > maxBytes) throw new Error("Upstream response is too large");
+  if (!response.body) {
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    if (buffer.byteLength > maxBytes) throw new Error("Upstream response is too large");
+    return buffer;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      // eslint-disable-next-line no-await-in-loop
+      await reader.cancel().catch(() => {});
+      throw new Error("Upstream response is too large");
+    }
+    chunks.push(value);
+  }
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
+  return buffer;
 }
 
 // Reads a Response body up to maxBytes, aborting mid-stream rather than
@@ -670,8 +743,12 @@ async function proxy(request, env) {
   // Open-Meteo in particular throttles in short rolling windows, so a
   // request that lands ~1.5s later after a burst (e.g. a single point click
   // firing several of its sub-services at once) commonly succeeds instead of
-  // surfacing a rate-limit error to the user.
+  // surfacing a rate-limit error to the user. Also covers 502/503/504: a
+  // "service unavailable" seen once on USGS waterservices and gone on the
+  // very next toggle is a transient upstream/edge hiccup, and those are
+  // exactly as likely to clear on a short retry as a 429 is.
   const retryDelaysMs = [0, 1500];
+  const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
   for (let attempt = 0; attempt < retryDelaysMs.length; attempt++) {
     if (retryDelaysMs[attempt]) await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
     try {
@@ -694,7 +771,7 @@ async function proxy(request, env) {
       }
       return error(cause.message || "Upstream request failed", 502);
     }
-    if (upstream.status !== 429 || attempt === retryDelaysMs.length - 1) break;
+    if (!RETRYABLE_STATUS.has(upstream.status) || attempt === retryDelaysMs.length - 1) break;
   }
 
   if (upstream.status >= 300 && upstream.status < 400) {
@@ -729,6 +806,224 @@ async function proxy(request, env) {
   });
 }
 
+const EUMETSAT_WMS_BASE = "https://view.eumetsat.int/geoserver/wms";
+// Every workspace map-overlays.js/geo-satellite-picker.js/metop-picker.js
+// currently build tile URLs against: mtg_fd (MTG), msg_fes/msg_rss
+// (Meteosat-0, incl. rapid scan), msg_iodc (Meteosat-IODC), eps (Metop).
+const EUMETSAT_LAYER_RE = /^(mtg_fd|msg_fes|msg_rss|msg_iodc|eps):[a-z0-9_]+$/;
+const EUMETSAT_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const MAX_TILE_BYTES = 8 * 1024 * 1024;
+
+// Imagery playback (imagery-playback.js) composites every frame onto an
+// offscreen <canvas> -- coverage stats, gap fill, frame fingerprinting and
+// GIF/PNG export all read pixels back out of it, which the browser only
+// allows once every source image carries CORS headers. EUMETSAT's own
+// GetMap endpoint never sends one (confirmed live, repeatedly, including on
+// a guaranteed-fresh never-before-requested bbox+time -- GetCapabilities
+// sends Access-Control-Allow-Origin fine, GetMap never does), so playback
+// for every EUMETSAT-hosted satellite (Meteosat, MTG, Metop) failed with
+// "no data" on every frame until this route existed. The live map's own
+// <img> tiles never read pixels back, so they still fetch EUMETSAT
+// directly, unproxied -- this route exists only for playback.
+// Deliberately narrow rather than a general image proxy: host, path and
+// every GetMap param except layers/time/bbox/crs/width/height is fixed
+// server-side, and those five are validated against exactly the shapes
+// map-overlays.js/imagery-playback.js are known to send.
+async function eumetsatTile(request) {
+  if (request.method !== "GET") return error("Method not allowed", 405);
+  const url = new URL(request.url);
+  const layers = url.searchParams.get("layers") || "";
+  const time = url.searchParams.get("time") || "";
+  const bbox = url.searchParams.get("bbox") || "";
+  const crs = url.searchParams.get("crs") || "EPSG:3857";
+  const width = Number(url.searchParams.get("width") || 256);
+  const height = Number(url.searchParams.get("height") || 256);
+
+  if (!EUMETSAT_LAYER_RE.test(layers)) return error("Invalid layers");
+  if (!EUMETSAT_TIME_RE.test(time)) return error("Invalid time");
+  const bboxParts = bbox.split(",").map(Number);
+  if (bboxParts.length !== 4 || !bboxParts.every(Number.isFinite)) return error("Invalid bbox");
+  if (crs !== "EPSG:3857" && crs !== "EPSG:4326") return error("Invalid crs");
+  // 1600 (not 512) since the playback tool's "single image" request method
+  // -- one WMS GetMap covering a whole satellite disc, see
+  // imagery-playback.js's captureSingleImageWmsFrame -- asks for up to
+  // SINGLE_IMAGE_SIZE (1536) on its long edge, not just a 256px tile.
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 1600 || height > 1600) {
+    return error("Invalid width/height");
+  }
+
+  const params = new URLSearchParams({
+    service: "WMS", request: "GetMap", layers, styles: "",
+    format: "image/png", transparent: "true", version: "1.3.0",
+    width: String(width), height: String(height), crs, bbox, time,
+  });
+  const target = `${EUMETSAT_WMS_BASE}?${params}`;
+
+  let upstream;
+  try {
+    upstream = await fetch(target, {
+      redirect: "manual",
+      headers: { Accept: "image/png,image/*" },
+      cf: { cacheEverything: true, cacheTtl: 120 },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (cause) {
+    if (cause.name === "TimeoutError" || cause.name === "AbortError") {
+      return error("EUMETSAT did not respond in time", 504);
+    }
+    return error(cause.message || "Upstream request failed", 502);
+  }
+  if (upstream.status >= 300 && upstream.status < 400) return error("Upstream redirect blocked", 502);
+  if (!upstream.ok) return error(`EUMETSAT returned HTTP ${upstream.status}`, 502);
+
+  let bytes;
+  try {
+    bytes = await readCappedBytes(upstream, MAX_TILE_BYTES);
+  } catch (cause) {
+    return error(cause.message, 502);
+  }
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": upstream.headers.get("Content-Type") || "image/png",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=120",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+// EXPERIMENTAL -- same story as eumetsatTile above, for CIRA/RAMMB's
+// tile-grid stitch (cira-picker.js draws fetched tiles onto a <canvas> and
+// exports via toBlob()). slider.cira.colostate.edu sends no
+// Access-Control-Allow-Origin (confirmed live), which taints the canvas
+// once a tile is drawn onto it. Every param is whitelisted/pattern-matched
+// against the real catalog (public/rammb-catalog.json), not passed through
+// as an arbitrary URL.
+const CIRA_SATELLITE_RE = /^(goes-19|goes-18|himawari|gk2a|meteosat-9|meteosat-0deg|meteosat-12|jpss)$/;
+const CIRA_SECTOR_RE = /^[a-z0-9_]+$/;
+const CIRA_PRODUCT_RE = /^[a-z0-9_]+$/;
+const CIRA_TIMESTAMP_RE = /^\d{14}$/;
+
+async function ciraTile(request) {
+  if (request.method !== "GET") return error("Method not allowed", 405);
+  const url = new URL(request.url);
+  const satellite = url.searchParams.get("satellite") || "";
+  const sector = url.searchParams.get("sector") || "";
+  const product = url.searchParams.get("product") || "";
+  const timestamp = url.searchParams.get("timestamp") || "";
+  const zoom = Number(url.searchParams.get("zoom") || 0);
+  const row = Number(url.searchParams.get("row") || 0);
+  const col = Number(url.searchParams.get("col") || 0);
+
+  if (!CIRA_SATELLITE_RE.test(satellite)) return error("Invalid satellite");
+  if (!CIRA_SECTOR_RE.test(sector)) return error("Invalid sector");
+  if (!CIRA_PRODUCT_RE.test(product)) return error("Invalid product");
+  if (!CIRA_TIMESTAMP_RE.test(timestamp)) return error("Invalid timestamp");
+  if (!Number.isInteger(zoom) || zoom < 0 || zoom > 9) return error("Invalid zoom");
+  if (!Number.isInteger(row) || row < 0 || row > 511) return error("Invalid row");
+  if (!Number.isInteger(col) || col < 0 || col > 511) return error("Invalid col");
+
+  const year = timestamp.slice(0, 4), month = timestamp.slice(4, 6), day = timestamp.slice(6, 8);
+  const zoomStr = String(zoom).padStart(2, "0");
+  const rowStr = String(row).padStart(3, "0");
+  const colStr = String(col).padStart(3, "0");
+  const target = `https://slider.cira.colostate.edu/data/imagery/${year}/${month}/${day}/${satellite}---${sector}/${product}/${timestamp}/${zoomStr}/${rowStr}_${colStr}.png`;
+
+  let upstream;
+  try {
+    // 60s, not 15 -- confirmed live (both through this proxy and fetching
+    // CIRA directly, bypassing us entirely) that a single tile at zoom > 0
+    // can take 40-50s from CIRA's own server right now. 15s meant most
+    // tiles for any resolution above Standard were silently timing out and
+    // getting dropped as "missing" (stitchFrame's per-tile catch), which is
+    // what "the other resolutions don't seem to load" actually was.
+    upstream = await fetch(target, {
+      redirect: "manual",
+      headers: { Accept: "image/png,image/*" },
+      cf: { cacheEverything: true, cacheTtl: 60 },
+      signal: AbortSignal.timeout(60000),
+    });
+  } catch (cause) {
+    if (cause.name === "TimeoutError" || cause.name === "AbortError") {
+      return error("CIRA did not respond in time", 504);
+    }
+    return error(cause.message || "Upstream request failed", 502);
+  }
+  if (upstream.status >= 300 && upstream.status < 400) return error("Upstream redirect blocked", 502);
+  if (!upstream.ok) return error(`CIRA returned HTTP ${upstream.status}`, upstream.status === 404 ? 404 : 502);
+
+  let bytes;
+  try {
+    bytes = await readCappedBytes(upstream, MAX_TILE_BYTES);
+  } catch (cause) {
+    return error(cause.message, 502);
+  }
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": upstream.headers.get("Content-Type") || "image/png",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=60",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+// EXPERIMENTAL -- same story, different upstream: api.helioviewer.org's
+// downloadImage endpoint sends no Access-Control-Allow-Origin either
+// (confirmed live, unlike services.swpc.noaa.gov's animation images, which
+// already do and so need no proxy). Without this, GIF/PNG/ZIP export of a
+// space-weather "History" (3d/7d) sequence would taint the canvas. id is
+// Helioviewer's own opaque numeric image id (from getClosestImage), not
+// user-authored.
+const HELIOVIEWER_ID_RE = /^\d+$/;
+
+async function helioviewerImage(request) {
+  if (request.method !== "GET") return error("Method not allowed", 405);
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id") || "";
+  const width = Number(url.searchParams.get("width") || 512);
+
+  if (!HELIOVIEWER_ID_RE.test(id)) return error("Invalid id");
+  if (!Number.isInteger(width) || width < 64 || width > 1024) return error("Invalid width");
+
+  const target = `https://api.helioviewer.org/v2/downloadImage/?id=${id}&width=${width}`;
+
+  let upstream;
+  try {
+    upstream = await fetch(target, {
+      redirect: "manual",
+      headers: { Accept: "image/png,image/*" },
+      cf: { cacheEverything: true, cacheTtl: 3600 },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (cause) {
+    if (cause.name === "TimeoutError" || cause.name === "AbortError") {
+      return error("Helioviewer did not respond in time", 504);
+    }
+    return error(cause.message || "Upstream request failed", 502);
+  }
+  if (upstream.status >= 300 && upstream.status < 400) return error("Upstream redirect blocked", 502);
+  if (!upstream.ok) return error(`Helioviewer returned HTTP ${upstream.status}`, 502);
+
+  let bytes;
+  try {
+    bytes = await readCappedBytes(upstream, MAX_TILE_BYTES);
+  } catch (cause) {
+    return error(cause.message, 502);
+  }
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": upstream.headers.get("Content-Type") || "image/png",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -741,6 +1036,15 @@ export default {
       url.pathname === "/api/usgs/proxy"
     ) {
       return proxy(request, env);
+    }
+    if (url.pathname === "/api/tiles/eumetsat") {
+      return eumetsatTile(request);
+    }
+    if (url.pathname === "/api/tiles/cira") {
+      return ciraTile(request);
+    }
+    if (url.pathname === "/api/tiles/helioviewer") {
+      return helioviewerImage(request);
     }
     if (url.pathname === "/api/keyed/firms") {
       return keyedFeed(request, env, "firms");
@@ -772,6 +1076,6 @@ export default {
 };
 
 export {
-  airNowItems, currentsTopicCandidates, currentsKeywords, buildUpstreamUrl, currentsNewsItems, firmsItems, gdeltNewsItems, thinFirmsItems,
+  airNowItems, currentsTopicCandidates, currentsKeywords, buildUpstreamUrl, currentsNewsItems, ciraTile, eumetsatTile, helioviewerImage, firmsItems, gdeltNewsItems, thinFirmsItems,
   keyedFeed, parseBbox, searchNews, SOURCES,
 };

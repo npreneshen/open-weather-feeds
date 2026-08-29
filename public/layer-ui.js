@@ -79,7 +79,24 @@ window.MetisLayerUI = (() => {
   }
 
   function description(layer) {
-    return layer.description || layer.note || DESCRIPTIONS[layer.id] || `${layer.provider || "Public"} data layer.`;
+    const base = layer.description || layer.note || DESCRIPTIONS[layer.id]
+      // layers.json's "history" field is otherwise unused -- it's already
+      // authored as good tooltip content for the handful of layers (mostly
+      // the satellite tier) that never got a hand-written DESCRIPTIONS entry,
+      // so lean on it instead of a bare stub.
+      || layer.history || "Data layer.";
+    // The row itself no longer shows a separate provider subtitle (see
+    // index.html's layer-picker-row template) -- attribution lives here,
+    // in the tooltip, instead. Most DESCRIPTIONS entries already name the
+    // provider in prose ("NASA GIBS daily true-colour..."), so only append
+    // it when the tooltip wouldn't otherwise say who the data is from (e.g.
+    // "AviationWeather" for volcanic ash, "Smithsonian" alongside USGS for
+    // volcanoes -- neither name appears in that layer's description text).
+    const provider = layer.provider || "";
+    if (!provider) return base;
+    const tokens = provider.split(/[/,+]| via | and /i).map((tok) => tok.trim()).filter(Boolean);
+    const covered = tokens.length > 0 && tokens.every((tok) => base.toLowerCase().includes(tok.toLowerCase()));
+    return covered ? base : `${base} -- ${provider}`;
   }
 
   function groupLabel(group) {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  airNowItems, currentsTopicCandidates, currentsKeywords, buildUpstreamUrl, currentsNewsItems, firmsItems, gdeltNewsItems,
+  airNowItems, currentsTopicCandidates, currentsKeywords, buildUpstreamUrl, currentsNewsItems, eumetsatTile, firmsItems, gdeltNewsItems,
   keyedFeed, parseBbox, searchNews, SOURCES, thinFirmsItems,
 } from "../worker/index.js";
 import worker from "../worker/index.js";
@@ -65,6 +65,30 @@ test("worker rejects non-object and excessive query parameters", () => {
     () => buildUpstreamUrl("nws", "/alerts", excessive),
     /Too many query parameters/,
   );
+});
+
+test("eumetsatTile rejects requests before ever reaching EUMETSAT", async () => {
+  const base = "https://example.test/api/tiles/eumetsat";
+  const good = "layers=eps%3Am01_rgb_natural_fog&time=2026-08-20T13%3A10%3A00Z&bbox=0,0,1,1&crs=EPSG%3A3857&width=256&height=256";
+
+  const badLayers = await eumetsatTile(new Request(`${base}?${good.replace(/layers=[^&]+/, "layers=not_a_real_workspace%3Afoo")}`));
+  assert.equal(badLayers.status, 400);
+  assert.match((await badLayers.json()).error.message, /Invalid layers/);
+
+  const badTime = await eumetsatTile(new Request(`${base}?${good.replace(/time=[^&]+/, "time=not-a-time")}`));
+  assert.equal(badTime.status, 400);
+  assert.match((await badTime.json()).error.message, /Invalid time/);
+
+  const badBbox = await eumetsatTile(new Request(`${base}?${good.replace(/bbox=[^&]+/, "bbox=only,two")}`));
+  assert.equal(badBbox.status, 400);
+  assert.match((await badBbox.json()).error.message, /Invalid bbox/);
+
+  const badSize = await eumetsatTile(new Request(`${base}?${good.replace(/width=[^&]+/, "width=9999")}`));
+  assert.equal(badSize.status, 400);
+  assert.match((await badSize.json()).error.message, /Invalid width\/height/);
+
+  const wrongMethod = await eumetsatTile(new Request(`${base}?${good}`, { method: "POST" }));
+  assert.equal(wrongMethod.status, 405);
 });
 
 test("keyed feeds fail safely without exposing or requiring a browser key", async () => {

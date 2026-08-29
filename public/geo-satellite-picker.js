@@ -31,26 +31,46 @@ window.MetisGeoSat = (() => {
   // these are the products with a real day-to-day-use case here (imagery +
   // the two things GOES/Himawari don't otherwise cover: a fire product and
   // a convective-storm tracker), not every RGB recipe EUMETSAT publishes.
+  // wv062 (water vapour) and rgb_microphysics (Day Microphysics RGB, VIS0.8-
+  // based so daytime-only like Natural Colour) confirmed live against both
+  // msg_fes and msg_iodc's own GetCapabilities before adding.
   const METEOSAT_OPTIONS = [
-    { id: "rgb_natural", label: "Natural Colour (true colour equivalent)" },
+    { id: "rgb_natural", label: "Natural Colour (true colour equivalent, daytime only)" },
     { id: "rgb_dust", label: "Dust RGB" },
     { id: "rgb_ash", label: "Volcanic Ash RGB" },
     { id: "rgb_airmass", label: "Air Mass RGB (jet streams, dry/moist air)" },
     { id: "rgb_convection", label: "Convection RGB (severe storm potential)" },
     { id: "rgb_fog", label: "Fog RGB" },
     { id: "rgb_snow", label: "Snow RGB" },
+    { id: "rgb_microphysics", label: "Day Microphysics RGB (cloud/fog/snow detail, daytime only)" },
+    { id: "wv062", label: "Water Vapour (6.2μm)" },
     { id: "ir108", label: "Clean Infrared (cloud-top temperature)" },
     { id: "fire", label: "Active fire detection" },
-    { id: "rdt", label: "Rapidly Developing Thunderstorms" },
+    // Confirmed live against msg_fes/msg_iodc's own GetCapabilities (25/21
+    // products respectively vs the 11 above) -- these are the remaining
+    // genuinely imagery/analysis-relevant ones; left out rdt_red/rdt_white/
+    // rdt_black (same Rapidly Developing Thunderstorms product as "rdt"
+    // below, just recoloured, not new data).
+    { id: "vis006", label: "Raw Visible (0.6μm, daytime only)" },
+    { id: "ir039", label: "Raw Shortwave Infrared (3.9μm, fire/fog detail)" },
+    { id: "clm", label: "Cloud Mask" },
+    { id: "cth", label: "Cloud Top Height" },
+    { id: "gii_kindex", label: "K-Index (thunderstorm instability)" },
+    { id: "gii_liftedindex", label: "Lifted Index (thunderstorm instability)" },
   ];
 
-  // Meteosat-0deg only -- EUMETSAT's Rapid Scan Service is a 5-minute-cadence
-  // product covering just the northern third of the disk (~15-70N, rectified
-  // at 9.5E, so Europe/North Africa), on its own `msg_rss` workspace rather
+  // Meteosat-0deg only -- confirmed against msg_fes's own GetCapabilities
+  // that "rdt" (Rapidly Developing Thunderstorms) only exists on this
+  // workspace, not msg_iodc's -- it 404s there (a genuine bug found and
+  // fixed this pass: msg_iodc's product dropdown used to offer it anyway).
+  // EUMETSAT's Rapid Scan Service is a separate 5-minute-cadence product
+  // covering just the northern third of the disk (~15-70N, rectified at
+  // 9.5E, so Europe/North Africa), on its own `msg_rss` workspace rather
   // than `msg_fes`. wmsLayerPrefix here overrides the satellite's default so
   // this one option can point at a different EUMETSAT workspace.
   const METEOSAT_0_OPTIONS = [
     ...METEOSAT_OPTIONS,
+    { id: "rdt", label: "Rapidly Developing Thunderstorms" },
     { id: "rgb_natural_nrt", label: "Rapid Scan Natural Colour (5-min, Europe/N.Africa only)", wmsLayerPrefix: "msg_rss" },
   ];
 
@@ -60,7 +80,17 @@ window.MetisGeoSat = (() => {
   // li_afa is MTG's Lightning Imager (Accumulated Flash Area, 5-min cadence)
   // -- the one genuinely live, free, public geostationary lightning product
   // found in this app's research; GOES' equivalent instrument has no public
-  // near-real-time feed.
+  // near-real-time feed. ir105_hrfi/vis06_hrfi (FCI's plain 10.5μm IR and
+  // 0.6μm visible channels) fill the plain Clean-Infrared/Red-Visible slot
+  // every other satellite here has -- note these are EUMETSAT's "HRFI"
+  // (High Resolution Fast Imagery) channels, which only scan two fixed
+  // regional strips rather than the full disk, and outside those strips the
+  // server renders no-data as opaque black rather than transparent (pixel-
+  // decoded and confirmed static across a 3.5h gap, so it's the fixed HRFI
+  // footprint, not a transient cloud gap) -- if MTG black-tile reports
+  // recur, rule these two in/out specifically before assuming it's disk-
+  // wide, since this is a known, narrower-than-full-disk limitation of
+  // just these two.
   const MTG_OPTIONS = [
     { id: "rgb_geocolour", label: "Geo Colour (true colour day / IR blend night)" },
     { id: "rgb_truecolour", label: "True Colour" },
@@ -70,7 +100,15 @@ window.MetisGeoSat = (() => {
     { id: "rgb_fog", label: "Fog RGB" },
     { id: "rgb_snow", label: "Snow RGB" },
     { id: "rgb_firetemperature", label: "Fire Temperature" },
+    { id: "ir105_hrfi", label: "Clean Infrared (cloud-top temperature, day/night)" },
+    { id: "vis06_hrfi", label: "Red Visible (daytime only)" },
     { id: "li_afa", label: "Lightning -- accumulated flash area (5-min)" },
+    // Confirmed live against mtg_fd's own GetCapabilities (18 products vs
+    // the 11 above); left out the style-only ir105_hrfi variants
+    // (mtg_fd_ir105_hrfi_grayscale/style_01/style_02 -- same channel as
+    // ir105_hrfi, just recoloured) and h40b/mtg_h40b_default (undocumented
+    // in EUMETSAT's public product list).
+    { id: "frp", label: "Fire Radiative Power" },
   ];
 
   const SATELLITES = {
@@ -142,6 +180,33 @@ window.MetisGeoSat = (() => {
 
   const ORDER = ["goesEast", "goesWest", "himawari", "meteosat0", "meteosatIodc", "mtg0"];
   const ACTIVE_KEY = "metis-geosat-active-list";
+
+  // "Single image" only exists for the EUMETSAT wms-type satellites below
+  // (GOES/Himawari are GIBS WMTS, which has no equivalent single-GetMap
+  // endpoint) -- one GetMap covering the satellite's whole viewable disc,
+  // built client-side into map tiles by map-overlays.js's
+  // EquirectangularTileLayer, instead of Leaflet's usual many-small-tiles
+  // WMS layer. Roughly matches each satellite's real ~81°-from-nadir disc
+  // limit with a little margin trimmed off (the very edge is mostly ocean/
+  // space anyway) rather than the full theoretical extent.
+  const REQUEST_MODE_KEY = "metis-geosat-request-mode";
+  const VIEW_BBOX = {
+    meteosat0: { west: -75, south: -75, east: 75, north: 75 },
+    meteosatIodc: { west: -30, south: -75, east: 121, north: 75 },
+    mtg0: { west: -75, south: -75, east: 75, north: 75 },
+  };
+
+  function requestMode() {
+    try { return localStorage.getItem(REQUEST_MODE_KEY) === "single" ? "single" : "tiles"; } catch { return "tiles"; }
+  }
+
+  function saveRequestMode(mode) {
+    try { localStorage.setItem(REQUEST_MODE_KEY, mode === "single" ? "single" : "tiles"); } catch { /* ignore */ }
+  }
+
+  function viewBbox(satId) {
+    return VIEW_BBOX[satId] || null;
+  }
 
   // Groups the modal by provider family so coverage is scannable at a
   // glance, rather than five flat rows with no visual hierarchy.
@@ -233,6 +298,7 @@ window.MetisGeoSat = (() => {
   // --- Modal: one checkbox + product dropdown per satellite ---
   let root = null;
   let pending = null;
+  let lastToggledOnSatId = null;
 
   function ensureStyles() {
     if (document.getElementById("metis-geosat-styles")) return;
@@ -243,9 +309,13 @@ window.MetisGeoSat = (() => {
         background:rgba(4,14,18,.6);align-items:center;justify-content:center}
       .metis-geosat-backdrop.show{display:flex}
       .metis-geosat-dialog{width:min(420px,calc(100vw - 32px));max-height:calc(100vh - 48px);
-        overflow-y:auto;overflow-x:hidden;background:#081d25;border:1px solid #304b52;
-        box-shadow:6px 6px 0 rgba(0,0,0,.45);font-family:"IBM Plex Mono",Consolas,monospace;color:#d8d1bc}
-      .metis-geosat-head{padding:10px 12px;border-bottom:1px solid #304b52;position:sticky;top:0;background:#081d25}
+        overflow-y:auto;overflow-x:hidden;
+        background:linear-gradient(135deg,var(--glass-panel-a,rgba(16,39,45,.9)),var(--glass-panel-b,rgba(7,25,31,.85)));
+        backdrop-filter:var(--glass-blur,blur(18px));-webkit-backdrop-filter:var(--glass-blur,blur(18px));
+        border:1px solid var(--glass-line,#304b52);border-radius:8px;background-clip:padding-box;
+        box-shadow:var(--glass-inner,inset 0 1px 0 rgba(255,255,255,.05)),var(--glass-drop,0 8px 24px rgba(0,8,12,.22)),0 20px 60px rgba(0,0,0,.45);
+        font-family:"IBM Plex Mono",Consolas,monospace;color:#d8d1bc}
+      .metis-geosat-head{padding:10px 12px;border-bottom:1px solid var(--glass-line,#304b52);position:sticky;top:0;background:transparent}
       .metis-geosat-kicker{font-size:.6rem;letter-spacing:.09em;text-transform:uppercase;color:#77949a}
       .metis-geosat-title{font-size:.85rem;color:#68cf91;margin-top:2px}
       .metis-geosat-body{padding:10px 12px;overflow-x:hidden}
@@ -267,9 +337,11 @@ window.MetisGeoSat = (() => {
         border-radius:0;font-size:.68rem;text-overflow:ellipsis;white-space:nowrap;overflow:hidden}
       .metis-geosat-sat-row select:disabled{opacity:.4}
       .metis-geosat-hint{font-size:.6rem;color:#77949a;margin:8px 0 0;line-height:1.5}
+      .metis-geosat-mode-select{width:auto;margin-top:4px;background:#06171e;border:1px solid #304b52;
+        color:#d8d1bc;padding:4px 6px;font:inherit;font-size:.65rem;border-radius:0}
       .metis-geosat-actions{display:flex;justify-content:flex-end;gap:8px;
-        padding:10px 12px;border-top:1px solid #304b52;position:sticky;bottom:0;background:#081d25}
-      .metis-geosat-actions button{border:1px solid #304b52;background:transparent;
+        padding:10px 12px;border-top:1px solid var(--glass-line,#304b52);position:sticky;bottom:0;background:transparent}
+      .metis-geosat-actions button{border:1px solid var(--glass-line,#304b52);background:transparent;
         color:#d8d1bc;padding:6px 12px;font:600 .65rem "IBM Plex Mono",monospace;
         text-transform:uppercase;letter-spacing:.05em;cursor:pointer;border-radius:0}
       .metis-geosat-actions [data-action="save"]{border-color:#68cf91;color:#68cf91}
@@ -283,10 +355,13 @@ window.MetisGeoSat = (() => {
     root = document.createElement("div");
     root.className = "metis-geosat-backdrop";
     root.innerHTML = `
-      <section class="metis-geosat-dialog" role="dialog" aria-modal="true" aria-labelledby="metis-geosat-title">
+      <section class="metis-geosat-dialog" role="dialog" aria-modal="true" aria-label="Geostationary satellites">
         <header class="metis-geosat-head">
           <div class="metis-geosat-kicker">Geostationary satellites</div>
-          <div class="metis-geosat-title" id="metis-geosat-title">Which satellites, which product</div>
+          <select class="metis-geosat-mode-select" data-geosat-mode title="Request method for Meteosat/MTG -- Tiles: sharper at high zoom, one failed request only blanks that tile. Single image: one request instead of many, capped resolution, a failed request blanks the whole layer. GOES/Himawari always use tiles regardless of this setting.">
+            <option value="tiles">Tiles</option>
+            <option value="single">Single image</option>
+          </select>
         </header>
         <div class="metis-geosat-body">
           ${GROUPS.map((group) => `
@@ -320,6 +395,11 @@ window.MetisGeoSat = (() => {
     root.querySelectorAll("[data-sat-checkbox]").forEach((cb) => {
       cb.addEventListener("change", () => {
         root.querySelector(`[data-sat-select="${cb.dataset.satCheckbox}"]`).disabled = !cb.checked;
+        // Remembered so Playback can switch to whichever satellite the user
+        // actually just turned on here, rather than always falling back to
+        // whichever one happens to sort first in ORDER -- see the
+        // metis-geosat-changed listener in index.html.
+        if (cb.checked) lastToggledOnSatId = cb.dataset.satCheckbox;
       });
     });
     root.querySelector('[data-action="cancel"]').addEventListener("click", () => finish(false));
@@ -333,6 +413,7 @@ window.MetisGeoSat = (() => {
         }
       });
       saveActiveSatellites(activeIds);
+      saveRequestMode(root.querySelector('[data-geosat-mode]').value);
       finish(true);
     });
     root.addEventListener("pointerdown", (event) => {
@@ -350,7 +431,7 @@ window.MetisGeoSat = (() => {
     pending = null;
     current.root.classList.remove("show");
     current.resolve(result);
-    if (result) window.dispatchEvent(new CustomEvent("metis-geosat-changed", {}));
+    if (result) window.dispatchEvent(new CustomEvent("metis-geosat-changed", { detail: { lastToggledOnSatId } }));
   }
 
   // satId argument kept optional/ignored -- callers used to open the picker
@@ -366,6 +447,7 @@ window.MetisGeoSat = (() => {
       select.disabled = !cb.checked;
       select.value = productFor(satId);
     });
+    dlg.querySelector('[data-geosat-mode]').value = requestMode();
     return new Promise((resolve) => {
       pending = { resolve, root: dlg };
       dlg.classList.add("show");
@@ -373,5 +455,8 @@ window.MetisGeoSat = (() => {
     });
   }
 
-  return { SATELLITES, ORDER, productFor, saveProduct, activeSatellites, saveActiveSatellites, layerInfo, prompt };
+  return {
+    SATELLITES, ORDER, productFor, saveProduct, activeSatellites, saveActiveSatellites, layerInfo, prompt,
+    requestMode, saveRequestMode, viewBbox,
+  };
 })();

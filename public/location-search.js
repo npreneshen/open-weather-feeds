@@ -30,6 +30,30 @@ window.MetisLocationSearch = (() => {
     document.head.appendChild(style);
   }
 
+  // Recognizes a typed "lat, lon" pair so the search box can jump straight
+  // to coordinates instead of only ever resolving a place name. Accepts an
+  // optional N/S/E/W suffix per number ("15.6N, 32.5E") as well as bare
+  // signed decimals ("-15.6, 32.5"), separated by a comma and/or space.
+  function parseCoordinates(query) {
+    const match = query.trim().match(
+      /^(-?\d+(?:\.\d+)?)\s*([NnSs])?\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*([EeWw])?$/,
+    );
+    if (!match) return null;
+    let lat = parseFloat(match[1]);
+    let lon = parseFloat(match[3]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (match[2]) lat = /s/i.test(match[2]) ? -Math.abs(lat) : Math.abs(lat);
+    if (match[4]) lon = /w/i.test(match[4]) ? -Math.abs(lon) : Math.abs(lon);
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+    return { lat, lon };
+  }
+
+  function formatCoord(lat, lon) {
+    const ns = lat >= 0 ? "N" : "S";
+    const ew = lon >= 0 ? "E" : "W";
+    return `${Math.abs(lat).toFixed(4)}°${ns}, ${Math.abs(lon).toFixed(4)}°${ew}`;
+  }
+
   function create({ map, dataApi, onSelect, zoom = 10, host = null } = {}) {
     if (!map || !dataApi || !window.L) throw new Error("Location search needs a map and data API.");
     ensureStyles();
@@ -43,7 +67,7 @@ window.MetisLocationSearch = (() => {
       root.innerHTML = `
         <input type="search" autocomplete="off" spellcheck="false" aria-label="Search for a location"
           data-lpignore="true" data-1p-ignore="true" data-form-type="other"
-          placeholder="Search location…" />
+          placeholder="Search location or lat, lon…" />
         <span class="metis-location-search-mark" aria-hidden="true">⌖</span>
         <div class="metis-location-results" role="listbox"></div>`;
       const input = root.querySelector("input");
@@ -99,6 +123,19 @@ window.MetisLocationSearch = (() => {
         clearTimeout(timer);
         const query = input.value.trim();
         if (query.length < 2) { close(); return; }
+        const coord = parseCoordinates(query);
+        if (coord) {
+          requestId++; // invalidate any in-flight place-name search
+          results = [{
+            latitude: coord.lat,
+            longitude: coord.lon,
+            name: formatCoord(coord.lat, coord.lon),
+            admin1: "Direct coordinates",
+            country: "",
+          }];
+          render();
+          return;
+        }
         timer = setTimeout(() => search(query), 260);
       });
       input.addEventListener("keydown", (event) => {

@@ -2,14 +2,26 @@
 
 **Live dashboard:** [Try Metis Weather](https://weather.metiscore.space)
 
+> **⚠️ The hosted versions (weather.metiscore.space) is not tied to this repo.** It's deployed straight
+> from a working folder via `wrangler pages deploy`, independently of `git`/GitHub — deploying
+> does not commit anything, and committing/pushing does not redeploy the site. The two can and
+> do drift out of sync.
+
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshot-1.png" alt="Metis Weather dashboard — main view" width="100%"></td>
-    <td width="50%"><img src="docs/screenshot-2.png" alt="Metis Weather dashboard — location detail" width="100%"></td>
+    <td width="33.33%"><img src="docs/screenshot-1.png" alt="Metis Weather dashboard — main view" width="100%"></td>
+    <td width="33.33%"><img src="docs/screenshot-2.png" alt="Metis Weather dashboard — location detail" width="100%"></td>
+    <td width="33.33%"><img src="docs/demo-1.gif" alt="Metis Weather — feature demo 1" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/demo-1.gif" alt="Metis Weather — feature demo 1" width="100%"></td>
-    <td width="50%"><img src="docs/demo-2.gif" alt="Metis Weather — feature demo 2" width="100%"></td>
+    <td width="33.33%"><img src="docs/demo-2.gif" alt="Metis Weather — feature demo 2" width="100%"></td>
+    <td width="33.33%"><img src="docs/metis-cira-goes-19-mesoscale-01-geocolor-z0-f24.gif" alt="CIRA/RAMMB — GOES-19 Mesoscale 1, GeoColor" width="100%"></td>
+    <td width="33.33%"><img src="docs/metis-cira-himawari-mesoscale-01-geocolor-z0-f24.gif" alt="CIRA/RAMMB — Himawari Mesoscale 1, GeoColor" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="33.33%"><img src="docs/metis-cira-himawari-mesoscale-01-eumetsat-severe-storms-rgb-z0-f24.gif" alt="CIRA/RAMMB — Himawari Mesoscale 1, Severe Storms RGB" width="100%"></td>
+    <td width="33.33%"><img src="docs/metis-lascoc2.gif" alt="Space weather imagery — LASCO C2 coronagraph" width="100%"></td>
+    <td width="33.33%"><img src="docs/metis-suvi195-frame.png" alt="Space weather imagery — GOES SUVI 195 Å" width="100%"></td>
   </tr>
 </table>
 
@@ -23,57 +35,29 @@ redirects to `/`; it is no longer a separate dashboard or codebase.
 
 ## What's new
 
-- **Imagery date picker and opacity slider for satellites.** Geostationary
-  imagery has its own historical date selector (step back a few days,
-  alongside the daily true-colour picker), and every raster/satellite layer
-  shares one opacity slider so you can dial a layer back without hiding it.
-- **Sharper location-aware news.** Reverse-geocoded place names now resolve
-  in English so international locations (e.g. clicking a city in China)
-  match news sources correctly, and the search progressively widens from the
-  exact locality to region, broader-place and country coverage until it
-  finds a meaningful number of results, instead of stopping at the first
-  weak match.
-- **API keys apply instantly.** Changing, saving or removing a FIRMS,
-  AirNow, Sentinel Hub or Currents key now refreshes the affected layer
-  immediately, with no page reload required.
-- **Every free geostationary satellite, one toggle.** GOES-East/West, Himawari
-  and Meteosat-0°/IODC (Europe, Africa, Indian Ocean) live behind a single
-  "Geostationary" layer with a picker for which satellites and products to
-  show at once — they tile together for wider coverage. The daily
-  true-colour source (Terra/Aqua/VIIRS) works the same way, one toggle with
-  a picker instead of three separate layers.
-- **Sentinel Hub, multiple saved configurations.** Add and name several
-  Sentinel Hub instance IDs from the same dialog and switch between them,
-  instead of only ever holding one key.
-- **Satellite imagery playback, rebuilt.** Play back a date range or release
-  history for NASA GIBS (Terra/Aqua/VIIRS daily true-colour), Esri World
-  Imagery/Wayback, GOES-East/West GeoColor, EOX Sentinel-2 cloud-free
-  composites and Sentinel Hub — all from one control, with GIF and full-
-  resolution PNG export, keyboard scrubbing, loop modes and adjustable
-  overlay opacity.
-  - **Gap fill** re-requests only the empty pixels of a frame along each
-    provider's own natural axis (a wider Sentinel scene-search window, a
-    sibling GIBS sensor, an earlier GOES scan, a prior EOX composite) instead
-    of leaving holes or discarding the whole frame.
-  - **Wayback release picking** uses ground-truth tile identity across
-    several points in the current view, so "distinct releases" means
-    genuinely different imagery for that location — not just different
-    release titles that happen to redirect to the same tiles.
-- **Sentinel, generalised.** Point it at any WMS layer or band your
-  Copernicus Data Space configuration exposes (true colour, false colour,
-  NDVI, NDWI, SWIR and more), not just Sentinel-2 true colour. Cloud-coverage
-  cap and resampling (nearest/bilinear/bicubic) are configurable, and the
-  layer can be reconfigured from the rail without toggling it off first.
-- **Location-aware news, sharper matching.** A local-news search now tries
-  each checked topic in turn for the selected point before widening to
-  country- or global-scope coverage, instead of only ever searching
-  "weather" and giving up early.
-- **Fewer rate-limit errors.** Local-dev API responses are now cached with
-  the same per-provider lifetimes as the deployed Worker, and transient
-  provider rate limits get one automatic retry.
-- **Works out of the box.** FIRMS, AirNow, Currents and Sentinel Hub ship
-  with default keys so every layer is usable immediately; each one can still
-  be replaced or cleared per-browser at any time.
+- CIRA/RAMMB: every satellite, sector and band from RAMMB/CIRA SLIDER —
+  GOES, Himawari, GK2A, Meteosat, JPSS. Resolution control, GIF/PNG/frame
+  export. Satellite category, above Imagery date.
+- More satellite bands: Meteosat/MTG — visible, shortwave IR, cloud mask,
+  cloud-top height, K-index, fire. VIIRS/JPSS — product picker with night
+  lights, cloud-top height, cirrus, false colour.
+- Space weather imagery (LASCO, SUVI, aurora, history) now exports to GIF,
+  PNG or a frame ZIP.
+- Basemap switched from CARTO to Esri — faster, no key needed. Town/city
+  labels are a separate layer.
+- Daily satellite VIIRS product picker: SNPP/NOAA-20 get 7 bands
+  (true/false colour, night lights, brightness temperature, cloud-top
+  height, cirrus); NOAA-21 gets 5.
+- New satellite sources: Geostationary (GOES/Himawari/Meteosat), Metop
+  polar orbiters, global IR mosaic, nighttime lights.
+- Space weather imagery browser: SDO, SUVI, LASCO, aurora, APOD, EPIC, TLE
+  orbits, plus NOAA scales, solar wind, Kp forecast.
+- Tropical cyclones: forecast/observed track and cone of uncertainty,
+  colour-coded by category. One-click switch to true-colour imagery.
+
+> The Sentinel Hub imagery uses a temporary shared key — get your own free
+> instance ID at [apps.sentinel-hub.com](https://apps.sentinel-hub.com) and
+> enter it in the API keys panel.
 
 ## What is included
 
